@@ -1,4 +1,5 @@
 import fs from 'fs';
+import { archiveAdmittedConversation, readRecordExclusions } from './record-admission.js';
 import path from 'path';
 import os from 'os';
 import { initDatabase, insertExchange } from './db.js';
@@ -44,6 +45,7 @@ export async function indexConversations(
   concurrency: number = 1,
   noSummaries: boolean = false
 ): Promise<void> {
+  readRecordExclusions();
   console.log('Initializing database...');
   const db = initDatabase();
 
@@ -114,15 +116,12 @@ export async function indexConversations(
       let exchanges;
       try {
         // Copy to archive (ensure parent dirs exist for subagent files)
-        if (!fs.existsSync(archivePath)) {
-          fs.mkdirSync(path.dirname(archivePath), { recursive: true });
-          fs.copyFileSync(sourcePath, archivePath);
-          console.log(`  Archived: ${file}`);
-        }
+        if (await archiveAdmittedConversation(sourcePath, archivePath)) console.log(`  Archived: ${file}`);
 
         // Parse conversation
         exchanges = await parseConversation(sourcePath, project, archivePath);
       } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') { db.close(); throw error; }
         console.log(`  Skipped ${file} (read failed: ${error instanceof Error ? error.message : error})`);
         continue;
       }
@@ -210,6 +209,7 @@ export async function indexConversations(
 }
 
 export async function indexSession(sessionId: string, concurrency: number = 1, noSummaries: boolean = false): Promise<void> {
+  readRecordExclusions();
   console.log(`Indexing session: ${sessionId}`);
 
   // Find the conversation file for this session
@@ -246,14 +246,12 @@ export async function indexSession(sessionId: string, concurrency: number = 1, n
       // Archive + parse — source may vanish mid-run (Claude Code cleanup).
       let exchanges;
       try {
-        if (!fs.existsSync(archivePath)) {
-          fs.mkdirSync(path.dirname(archivePath), { recursive: true });
-          fs.copyFileSync(sourcePath, archivePath);
-        }
+        await archiveAdmittedConversation(sourcePath, archivePath);
         exchanges = await parseConversation(sourcePath, project, archivePath);
       } catch (error) {
-        console.log(`Skipped ${file} (read failed: ${error instanceof Error ? error.message : error})`);
         db.close();
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        console.log(`Skipped ${file} (read failed: ${error instanceof Error ? error.message : error})`);
         break;
       }
 
@@ -313,6 +311,7 @@ export async function indexSession(sessionId: string, concurrency: number = 1, n
 }
 
 export async function indexUnprocessed(concurrency: number = 1, noSummaries: boolean = false): Promise<void> {
+  readRecordExclusions();
   console.log('Finding unprocessed conversations...');
   if (concurrency > 1) console.log(`Concurrency: ${concurrency}`);
   if (noSummaries) console.log('⚠️  Running in no-summaries mode (skipping AI summaries)');
@@ -366,9 +365,7 @@ export async function indexUnprocessed(concurrency: number = 1, noSummaries: boo
         fs.mkdirSync(path.dirname(archivePath), { recursive: true });
 
         // Refresh the archive when the source may have grown beyond what we've seen.
-        if (!fs.existsSync(archivePath) || maxIndexedLine > 0) {
-          fs.copyFileSync(sourcePath, archivePath);
-        }
+        await archiveAdmittedConversation(sourcePath, archivePath);
 
         // Parse and filter to exchanges past the high-water mark
         const exchanges = await parseConversation(sourcePath, project, archivePath);
@@ -379,6 +376,7 @@ export async function indexUnprocessed(concurrency: number = 1, noSummaries: boo
 
         unprocessed.push({ project, file, sourcePath, archivePath, summaryPath, exchanges: newExchanges });
       } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') { db.close(); throw error; }
         console.log(`  Skipped ${file} (read failed: ${error instanceof Error ? error.message : error})`);
         continue;
       }

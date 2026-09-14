@@ -1,4 +1,5 @@
 import fs from 'fs';
+import { archiveAdmittedConversation, readRecordExclusions } from './record-admission.js';
 import path from 'path';
 import { initDatabase, insertExchange } from './db.js';
 import { parseConversation } from './parser.js';
@@ -26,6 +27,7 @@ function sessionIdForSummary(exchanges) {
     return exchanges.find(exchange => exchange.sessionId)?.sessionId;
 }
 export async function indexConversations(limitToProject, maxConversations, concurrency = 1, noSummaries = false) {
+    readRecordExclusions();
     console.log('Initializing database...');
     const db = initDatabase();
     console.log('Loading embedding model...');
@@ -74,15 +76,16 @@ export async function indexConversations(limitToProject, maxConversations, concu
                 let exchanges;
                 try {
                     // Copy to archive (ensure parent dirs exist for subagent files)
-                    if (!fs.existsSync(archivePath)) {
-                        fs.mkdirSync(path.dirname(archivePath), { recursive: true });
-                        fs.copyFileSync(sourcePath, archivePath);
+                    if (await archiveAdmittedConversation(sourcePath, archivePath))
                         console.log(`  Archived: ${file}`);
-                    }
                     // Parse conversation
                     exchanges = await parseConversation(sourcePath, project, archivePath);
                 }
                 catch (error) {
+                    if (error.code !== 'ENOENT') {
+                        db.close();
+                        throw error;
+                    }
                     console.log(`  Skipped ${file} (read failed: ${error instanceof Error ? error.message : error})`);
                     continue;
                 }
@@ -159,6 +162,7 @@ export async function indexConversations(limitToProject, maxConversations, concu
     console.log(`\n✅ Indexing complete! Conversations: ${conversationsProcessed}, Exchanges: ${totalExchanges}`);
 }
 export async function indexSession(sessionId, concurrency = 1, noSummaries = false) {
+    readRecordExclusions();
     console.log(`Indexing session: ${sessionId}`);
     // Find the conversation file for this session
     const sourceDirs = getConversationSourceDirs();
@@ -187,15 +191,14 @@ export async function indexSession(sessionId, concurrency = 1, noSummaries = fal
                 // Archive + parse — source may vanish mid-run (Claude Code cleanup).
                 let exchanges;
                 try {
-                    if (!fs.existsSync(archivePath)) {
-                        fs.mkdirSync(path.dirname(archivePath), { recursive: true });
-                        fs.copyFileSync(sourcePath, archivePath);
-                    }
+                    await archiveAdmittedConversation(sourcePath, archivePath);
                     exchanges = await parseConversation(sourcePath, project, archivePath);
                 }
                 catch (error) {
-                    console.log(`Skipped ${file} (read failed: ${error instanceof Error ? error.message : error})`);
                     db.close();
+                    if (error.code !== 'ENOENT')
+                        throw error;
+                    console.log(`Skipped ${file} (read failed: ${error instanceof Error ? error.message : error})`);
                     break;
                 }
                 if (exchanges.length > 0) {
@@ -249,6 +252,7 @@ export async function indexSession(sessionId, concurrency = 1, noSummaries = fal
     }
 }
 export async function indexUnprocessed(concurrency = 1, noSummaries = false) {
+    readRecordExclusions();
     console.log('Finding unprocessed conversations...');
     if (concurrency > 1)
         console.log(`Concurrency: ${concurrency}`);
@@ -284,9 +288,7 @@ export async function indexUnprocessed(concurrency = 1, noSummaries = false) {
                 try {
                     fs.mkdirSync(path.dirname(archivePath), { recursive: true });
                     // Refresh the archive when the source may have grown beyond what we've seen.
-                    if (!fs.existsSync(archivePath) || maxIndexedLine > 0) {
-                        fs.copyFileSync(sourcePath, archivePath);
-                    }
+                    await archiveAdmittedConversation(sourcePath, archivePath);
                     // Parse and filter to exchanges past the high-water mark
                     const exchanges = await parseConversation(sourcePath, project, archivePath);
                     const newExchanges = maxIndexedLine > 0
@@ -297,6 +299,10 @@ export async function indexUnprocessed(concurrency = 1, noSummaries = false) {
                     unprocessed.push({ project, file, sourcePath, archivePath, summaryPath, exchanges: newExchanges });
                 }
                 catch (error) {
+                    if (error.code !== 'ENOENT') {
+                        db.close();
+                        throw error;
+                    }
                     console.log(`  Skipped ${file} (read failed: ${error instanceof Error ? error.message : error})`);
                     continue;
                 }

@@ -85,6 +85,16 @@ describe('install-runner — runNpmInstall termination handling (#161)', () => {
     try { rmSync(root, { recursive: true, force: true }); } catch {}
   });
 
+  it('uses npm ci when a qualified package lock is shipped', async () => {
+    writeFileSync(join(root, 'package-lock.json'), '{"lockfileVersion":3}');
+    const child = makeFakeChild();
+    const fakeSpawn = vi.fn(() => child);
+    const install = runNpmInstall(root, { spawn: fakeSpawn });
+    expect(fakeSpawn.mock.calls[0][1]).toEqual(['ci', '--no-audit', '--no-fund']);
+    child.emit('exit', 0);
+    await install.promise;
+  });
+
   it('terminate() kills the injected child and releases the lock, and leaves no listener leak after the child later reports exit', async () => {
     const beforeSigterm = process.listenerCount('SIGTERM');
     const beforeSigint = process.listenerCount('SIGINT');

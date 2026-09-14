@@ -417,7 +417,7 @@ open output.html
 
 ## Excluding Conversations
 
-Conversations containing this marker anywhere in their content will be archived but not indexed:
+Conversations containing this marker anywhere in their content are excluded before new archive copying, parsing, and indexing:
 
 ```
 <INSTRUCTIONS-TO-EPISODIC-MEMORY>DO NOT INDEX THIS CHAT</INSTRUCTIONS-TO-EPISODIC-MEMORY>
@@ -433,7 +433,78 @@ Conversations containing this marker anywhere in their content will be archived 
 - Test or experimental sessions
 - Any conversation you don't want searchable
 
-The marker can appear in any message (user or assistant) and excludes the entire conversation from the search index.
+The marker can appear in any message (user or assistant). It prevents new derived copies and indexing; it does not delete an existing archive or index entry.
+
+### Persistent record exclusions
+
+`record-exclusions.json` in the existing configuration directory defines exact
+records that must not enter new derived archives, parser output, summaries, or
+database insertions. It is independent of `CONVERSATION_SEARCH_EXCLUDE_PROJECTS`;
+that environment variable cannot replace or disable record exclusions.
+
+```json
+{
+  "version": 1,
+  "exchanges": [
+    {
+      "session_id": "00000000-1111-4222-8333-444444444444",
+      "transcript": "rollout-00000000-1111-4222-8333-444444444444.jsonl",
+      "line_start": 4,
+      "line_end": 5
+    }
+  ],
+  "tool_calls": [
+    {
+      "session_id": "00000000-1111-4222-8333-444444444444",
+      "transcript": "rollout-00000000-1111-4222-8333-444444444444.jsonl",
+      "call_id": "call-example"
+    }
+  ]
+}
+```
+
+Line ranges are inclusive physical JSONL coordinates in the original transcript.
+Excluded records become empty lines in a derived copy, preserving later line
+numbers. Session identity, exact transcript basename and native tool-call identity, not
+a machine-specific absolute path, bind the policy. Sibling subagent transcripts
+sharing a parent session are separate subjects. Safe text blocks remain when only a tool block
+is excluded. Original transcripts are never changed.
+
+Malformed, unreadable, symlinked or oversized policy files reject admission.
+When a policy is present, unchanged source timestamps do not bypass a fresh
+admission decision. Source/archive aliasing and changing input are rejected.
+The marker scan and record stream use the same descriptor; source identity is
+checked during and after streaming. Direct database insertion checks both the
+transcript identity and historical session metadata, which may name an ancestor.
+The foreground sync CLI exits nonzero for per-file admission errors and does not
+claim successful synchronization or start embedding migration after those errors.
+Full, session and incremental indexing, repair, MCP reads and the display CLI use
+the same admission boundary. Display pagination retains physical line numbers.
+An absent policy retains ordinary behavior; deleting the policy intentionally
+removes its protection, so maintain it as private operator configuration.
+
+Summarization with a record policy uses admitted transcript text, never a resumed
+source session. Codex retains its selected provider through an ephemeral fresh
+context and fails rather than silently falling back to another provider. Claude
+receives the admitted text without session resume. Policy-enabled Codex summaries
+require Codex 0.154.0 or newer. The subprocess disables host tools, plugins, hooks,
+apps, automatic instructions and bundled skills before startup, then disables
+each inherited MCP and skill entry. It receives no execution environments or
+capability roots and uses a temporary empty working directory. The native skills
+namespace may remain visible but has no accessible packages. A native synthetic
+Responses peer verified empty skill discovery and rejected skill, shell and MCP
+reads; no real model or production credential was used. Provider error payloads
+are suppressed, and the temporary directory is removed after process termination.
+
+The shipped dependency lock is authoritative for bootstrap: the native install
+runner uses `npm ci` when the lock exists. Native install and removal were
+qualified in an isolated home, including clean SQLite/vector/Transformers loads.
+
+This policy is an exclusion mechanism, not a secret detector. It does not prove
+that unknown records are safe, purge preexisting derived data, rewrite original
+sessions, or retroactively filter already-loaded code. Old randomly generated
+tool-row IDs need verified native source-call mapping before policy migration;
+do not broaden those entries to whole sessions or claim a complete migration.
 
 ## MCP Server
 

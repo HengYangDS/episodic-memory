@@ -1,4 +1,5 @@
 import Database from 'better-sqlite3';
+import { admitExchange } from './record-admission.js';
 import path from 'path';
 import fs from 'fs';
 import * as sqliteVec from 'sqlite-vec';
@@ -186,6 +187,10 @@ export function initDatabase() {
     return db;
 }
 export function insertExchange(db, exchange, embedding, toolNames) {
+    const admitted = admitExchange(exchange);
+    if (!admitted)
+        return;
+    exchange = admitted;
     const now = Date.now();
     const stmt = db.prepare(`
     INSERT OR REPLACE INTO exchanges

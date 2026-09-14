@@ -4,6 +4,7 @@ import { parseConversation } from './parser.js';
 import { initDatabase, getAllExchanges, getFileLastIndexed } from './db.js';
 import { getArchiveDir, getExcludedProjects, findJsonlFiles, statIfExists } from './paths.js';
 import { isErroredSentinel } from './summary-sentinel.js';
+import { readRecordExclusions } from './record-admission.js';
 
 export interface VerificationResult {
   missing: Array<{ path: string; reason: string }>;
@@ -119,6 +120,7 @@ export async function verifyIndex(): Promise<VerificationResult> {
 }
 
 export async function repairIndex(issues: VerificationResult): Promise<void> {
+  readRecordExclusions();
   console.log('Repairing index...');
 
   // To avoid circular dependencies, we import the indexer functions dynamically
@@ -178,6 +180,8 @@ export async function repairIndex(issues: VerificationResult): Promise<void> {
       console.log(`  Indexed ${exchanges.length} exchanges`);
     } catch (error) {
       console.error(`Failed to re-index ${conversationPath}:`, error);
+      db.close();
+      throw error;
     }
   }
 

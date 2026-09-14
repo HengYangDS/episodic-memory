@@ -230,7 +230,7 @@ describe('show command - markdown formatting', () => {
     expect(markdown).toMatch(/\*\*Agent\*\*/);
     expect(markdown).toContain('Looking at your instructions');
 
-    const expectedTimestamp = new Date('2025-09-19T17:34:29.181Z').toLocaleString();
+    const expectedTimestamp = new Date('2025-09-19T17:34:29.181Z').toLocaleString('en-US', { timeZone: 'UTC' });
     expect(markdown).toContain(expectedTimestamp);
   });
 

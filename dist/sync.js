@@ -1,56 +1,11 @@
 import fs from 'fs';
+import { archiveAdmittedConversation, readRecordExclusions } from './record-admission.js';
 import path from 'path';
-import { StringDecoder } from 'string_decoder';
-import { SUMMARIZER_CONTEXT_MARKER } from './constants.js';
 import { getExcludedProjects, findJsonlFiles, statIfExists } from './paths.js';
 import { formatErrorSentinel, shouldQueueForSummary } from './summary-sentinel.js';
 import { getMaxMessageBytes, isOversizeExchange } from './message-size.js';
-const EXCLUSION_MARKERS = [
-    '<INSTRUCTIONS-TO-EPISODIC-MEMORY>DO NOT INDEX THIS CHAT</INSTRUCTIONS-TO-EPISODIC-MEMORY>',
-    'Only use NO_INSIGHTS_FOUND',
-    SUMMARIZER_CONTEXT_MARKER,
-];
-const MARKER_SCAN_CHUNK_BYTES = 1 << 20; // 1 MiB
-/**
- * Stream and scan for any exclusion marker, carrying an overlap between
- * chunks so a marker split across a boundary is still found. A single
- * fs.readFileSync(path, 'utf-8') throws ERR_STRING_TOO_LONG above Node's
- * ~512 MB max string length; the old catch returned false (fail OPEN),
- * silently indexing a file whose DO NOT INDEX marker we never read (#152).
- * Streaming confirms cleanliness at any size, and a real read error now
- * fails CLOSED (skip) rather than open.
- */
-export function shouldSkipConversation(filePath) {
-    const maxMarkerLen = Math.max(...EXCLUSION_MARKERS.map(m => m.length));
-    let fd;
-    try {
-        fd = fs.openSync(filePath, 'r');
-        const buf = Buffer.allocUnsafe(MARKER_SCAN_CHUNK_BYTES);
-        const decoder = new StringDecoder('utf8');
-        let carry = '';
-        let bytesRead;
-        while ((bytesRead = fs.readSync(fd, buf, 0, buf.length, null)) > 0) {
-            const window = carry + decoder.write(buf.subarray(0, bytesRead));
-            if (EXCLUSION_MARKERS.some(marker => window.includes(marker))) {
-                return true;
-            }
-            carry = window.slice(Math.max(0, window.length - (maxMarkerLen - 1)));
-        }
-        const tail = carry + decoder.end();
-        return EXCLUSION_MARKERS.some(marker => tail.includes(marker));
-    }
-    catch {
-        return true; // fail closed (#152)
-    }
-    finally {
-        if (fd !== undefined) {
-            try {
-                fs.closeSync(fd);
-            }
-            catch { }
-        }
-    }
-}
+export { shouldSkipConversation } from './record-admission.js';
+import { shouldSkipConversation } from './record-admission.js';
 /**
  * True when a transcript contains at least one message line in any supported
  * harness format. Summarizer-spawned Agent SDK sessions materialize as
@@ -122,33 +77,6 @@ function hasConversationContent(filePath) {
 export function buildSyncOptionsFromEnv(env) {
     return { skipSummaries: env.EPISODIC_MEMORY_SKIP_SUMMARIES === '1' };
 }
-function copyIfNewer(src, dest) {
-    // Ensure destination directory exists
-    const destDir = path.dirname(dest);
-    if (!fs.existsSync(destDir)) {
-        fs.mkdirSync(destDir, { recursive: true });
-    }
-    // Check if destination exists and is up-to-date
-    if (fs.existsSync(dest)) {
-        const srcStat = fs.statSync(src);
-        const destStat = fs.statSync(dest);
-        if (destStat.mtimeMs >= srcStat.mtimeMs) {
-            return false; // Dest is current, skip
-        }
-    }
-    // Atomic copy: temp file + rename
-    const tempDest = dest + '.tmp.' + process.pid;
-    fs.copyFileSync(src, tempDest);
-    fs.renameSync(tempDest, dest); // Atomic on same filesystem
-    // Preserve source mtime: harnesses without per-message timestamps (Cursor
-    // agent transcripts) fall back to file mtime. Round up to the next whole
-    // millisecond — utimes can't always represent the source's sub-millisecond
-    // precision, and a dest mtime even fractionally older would defeat the
-    // skip-if-current check above on every subsequent sync.
-    const srcStat = fs.statSync(src);
-    fs.utimesSync(dest, srcStat.atimeMs / 1000, Math.ceil(srcStat.mtimeMs) / 1000);
-    return true;
-}
 export function extractSessionIdFromPath(filePath) {
     // Extract session ID from Claude filename or Codex rollout filename.
     const basename = path.basename(filePath, '.jsonl');
@@ -160,6 +88,7 @@ export function extractSessionIdFromPath(filePath) {
     return null;
 }
 export async function syncConversations(sourceDir, destDir, options = {}) {
+    const exclusions = readRecordExclusions();
     const result = {
         copied: 0,
         skipped: 0,
@@ -198,7 +127,7 @@ export async function syncConversations(sourceDir, destDir, options = {}) {
                     result.skipped++;
                     continue;
                 }
-                const wasCopied = copyIfNewer(srcFile, destFile);
+                const wasCopied = await archiveAdmittedConversation(srcFile, destFile, exclusions);
                 if (wasCopied) {
                     result.copied++;
                     filesToIndex.push(destFile);

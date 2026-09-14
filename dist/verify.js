@@ -4,6 +4,7 @@ import { parseConversation } from './parser.js';
 import { initDatabase, getAllExchanges, getFileLastIndexed } from './db.js';
 import { getArchiveDir, getExcludedProjects, findJsonlFiles, statIfExists } from './paths.js';
 import { isErroredSentinel } from './summary-sentinel.js';
+import { readRecordExclusions } from './record-admission.js';
 export async function verifyIndex() {
     const result = {
         missing: [],
@@ -92,6 +93,7 @@ export async function verifyIndex() {
     return result;
 }
 export async function repairIndex(issues) {
+    readRecordExclusions();
     console.log('Repairing index...');
     // To avoid circular dependencies, we import the indexer functions dynamically
     const { initDatabase, insertExchange, deleteExchange } = await import('./db.js');
@@ -138,6 +140,8 @@ export async function repairIndex(issues) {
         }
         catch (error) {
             console.error(`Failed to re-index ${conversationPath}:`, error);
+            db.close();
+            throw error;
         }
     }
     db.close();

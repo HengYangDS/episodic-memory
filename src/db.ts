@@ -1,4 +1,5 @@
 import Database from 'better-sqlite3';
+import { admitExchange } from './record-admission.js';
 import { ConversationExchange } from './types.js';
 import path from 'path';
 import fs from 'fs';
@@ -216,6 +217,9 @@ export function insertExchange(
   embedding: number[],
   toolNames?: string[]
 ): void {
+  const admitted = admitExchange(exchange);
+  if (!admitted) return;
+  exchange = admitted;
   const now = Date.now();
 
   const stmt = db.prepare(`

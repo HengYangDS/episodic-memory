@@ -281,6 +281,13 @@ describe('repairIndex', () => {
     dbAfter.close();
   });
 
+  it('rejects a failed repair instead of reporting completion', async () => {
+    const input = path.join(archiveDir, 'not-a-transcript');
+    fs.mkdirSync(input, { recursive: true });
+    await expect(repairIndex({ missing: [{ path: input, reason: 'synthetic invalid source' }],
+      outdated: [], orphaned: [], corrupted: [] })).rejects.toThrow(/regular non-symlink file/);
+  });
+
   it('re-indexes outdated files during repair', { timeout: 30000 }, async () => {
     // Create conversation file with summary
     const projectArchive = path.join(archiveDir, 'test-project');

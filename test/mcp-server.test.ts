@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -120,5 +120,35 @@ describe('MCP search tool', () => {
       mode: 'text',
     });
     expect(existsSync(testDbPath)).toBe(true);
+  });
+
+  it('applies live record exclusions to direct reads and keeps physical range coordinates', async () => {
+    const session = '00000000-1111-4222-8333-444444444444';
+    const file = join(testDir!, `rollout-${session}.jsonl`);
+    const config = join(testDir!, 'config', 'record-exclusions.json');
+    mkdirSync(join(testDir!, 'config'), { recursive: true });
+    const rows = [
+      { type: 'session_meta', payload: { id: session } },
+      ...['safe first', 'EXCLUDED_PUBLIC_FIXTURE', 'safe last'].map(text => ({ type: 'response_item',
+        payload: { type: 'message', role: 'user', content: [{ type: 'text', text }] } })),
+    ];
+    const original = rows.map(row => JSON.stringify(row)).join('\n') + '\n';
+    writeFileSync(file, original);
+    writeFileSync(config, JSON.stringify({ version: 1,
+      exchanges: [{ session_id: session, transcript: `rollout-${session}.jsonl`, line_start: 3, line_end: 3 }], tool_calls: [] }));
+    try {
+      const result = await client.callTool({ name: 'read', arguments: { path: file } });
+      expect(result.isError).toBeFalsy();
+      const text = getTextContent(result.content as ToolContent[]);
+      expect(text).not.toContain('EXCLUDED_PUBLIC_FIXTURE');
+      expect(text).toContain('safe first');
+      expect(text).toContain('safe last');
+      const ranged = await client.callTool({ name: 'read', arguments: { path: file, startLine: 4, endLine: 4 } });
+      expect(ranged.isError).toBeFalsy();
+      const rangedText = getTextContent(ranged.content as ToolContent[]);
+      expect(rangedText).toContain('safe last');
+      expect(rangedText).not.toContain('safe first');
+      expect(readFileSync(file, 'utf8')).toBe(original);
+    } finally { unlinkSync(config); unlinkSync(file); }
   });
 });

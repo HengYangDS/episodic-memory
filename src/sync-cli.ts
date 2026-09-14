@@ -224,7 +224,12 @@ async function syncAll() {
     totals.errors.push(...result.errors);
   }
 
-  console.log(`\n✅ Sync complete!`);
+  // Admission failure is a partial run, not successful synchronization.
+  // Finish migration before emitting a success claim as well.
+  if (totals.errors.length === 0) await runEmbeddingMigrationPhase();
+  else process.exitCode = 1;
+
+  console.log(totals.errors.length ? '\nSync finished with errors.' : '\n✅ Sync complete!');
   console.log(`  Copied: ${totals.copied}`);
   console.log(`  Skipped: ${totals.skipped}`);
   console.log(`  Indexed: ${totals.indexed}`);
@@ -246,10 +251,6 @@ async function syncAll() {
     }
   }
 
-  // After regular sync, do a batch of embedding migration if any rows are
-  // still on the old encoder. Lock-protected; if another process is already
-  // migrating, this is a no-op.
-  await runEmbeddingMigrationPhase();
 }
 
 const MIGRATION_BATCH_SIZE = parseInt(process.env.EPISODIC_MEMORY_MIGRATION_BATCH || '500', 10);
@@ -270,6 +271,7 @@ async function runEmbeddingMigrationPhase(): Promise<void> {
     }
   } catch (err) {
     console.error('episodic-memory: migration phase error:', err instanceof Error ? err.message : err);
+    throw err;
   } finally {
     db.close();
   }

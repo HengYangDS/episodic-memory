@@ -133,7 +133,8 @@ export function runNpmInstall(pluginRoot, { spawn = defaultSpawn, lockHandle } =
   console.error('Installing episodic-memory dependencies (first run only)...');
   console.error('This may take 30-60 seconds...');
 
-  const child = spawn(npmCommand, ['install', '--no-audit', '--no-fund'], {
+  const installMode = existsSync(join(pluginRoot, 'package-lock.json')) ? 'ci' : 'install';
+  const child = spawn(npmCommand, [installMode, '--no-audit', '--no-fund'], {
     cwd: pluginRoot,
     stdio: ['ignore', 'pipe', 'pipe'],
     shell: isWindows, // On Windows, we need shell: true to find npm.cmd
