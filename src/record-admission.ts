@@ -1,6 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import os from 'node:os';
+import { spawnSync } from 'node:child_process';
 import { StringDecoder } from 'node:string_decoder';
 import { SUMMARIZER_CONTEXT_MARKER } from './constants.js';
 import type { ConversationExchange } from './types.js';
@@ -98,6 +100,13 @@ export interface RecordExclusions {
   version: 1;
   exchanges: ExchangeExclusion[];
   tool_calls: ToolExclusion[];
+  screening?: {
+    engine: 'gitleaks';
+    executable: string;
+    sha256: string;
+    timeout_ms: number;
+    max_record_bytes: number;
+  };
 }
 
 const POLICY_ERROR = 'Invalid or unreadable record exclusion policy';
@@ -119,6 +128,94 @@ function identity(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0 && value.length <= 512 && !/[\x00-\x1f]/.test(value);
 }
 
+/** Keep scanner inputs local to one record, including JSON-escaped text. */
+function screeningText(value: unknown, depth = 0): string {
+  if (depth > 24) throw new Error('Record screening nesting limit exceeded');
+  if (typeof value === 'string') {
+    let decoded: unknown;
+    try { decoded = JSON.parse(value); } catch { return value; }
+    if (typeof decoded === 'string' || object(decoded) || Array.isArray(decoded)) {
+      return screeningText(decoded, depth + 1);
+    }
+    return value;
+  }
+  if (Array.isArray(value)) return value.map(item => screeningText(item, depth + 1)).join('\n');
+  if (object(value)) {
+    // Generic credential rules need an assignment delimiter, not just a nearby
+    // keyword. Decode nested text without destroying its key/value relation.
+    return Object.entries(value).map(([key, item]) => `${key} = ${screeningText(item, depth + 1)}`).join('\n');
+  }
+  return value == null ? '' : String(value);
+}
+
+/** One pinned, short-lived local scanner context; no secret-bearing cache. */
+function createRecordScreener(policy: RecordExclusions | null): { scan(value: unknown): void; close(): void } {
+  const config = policy?.screening;
+  if (!config) return { scan() {}, close() {} };
+  const unavailable = () => new Error('Record screening unavailable');
+  let initial: fs.Stats;
+  let fd: number | undefined;
+  try {
+    if (fs.realpathSync(config.executable) !== config.executable) throw unavailable();
+    fd = fs.openSync(config.executable, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    initial = fs.fstatSync(fd);
+    if (!initial.isFile() || initial.size < 1 || initial.size > 134_217_728 ||
+        (initial.mode & 0o022) !== 0 ||
+        (typeof process.getuid === 'function' && initial.uid !== 0 && initial.uid !== process.getuid())) {
+      throw unavailable();
+    }
+    fs.accessSync(config.executable, fs.constants.X_OK);
+    const digest = crypto.createHash('sha256').update(fs.readFileSync(fd)).digest('hex');
+    if (digest !== config.sha256) throw unavailable();
+  } catch { throw unavailable(); }
+  finally { if (fd !== undefined) fs.closeSync(fd); }
+  let directory: string;
+  try {
+    directory = fs.mkdtempSync(path.join(os.tmpdir(), 'episodic-screen-'));
+    fs.chmodSync(directory, 0o700);
+  } catch { throw unavailable(); }
+  const unchanged = () => {
+    try {
+      const current = fs.lstatSync(config.executable);
+      if (!current.isFile() || current.dev !== initial.dev || current.ino !== initial.ino ||
+          current.size !== initial.size || current.mtimeMs !== initial.mtimeMs ||
+          current.ctimeMs !== initial.ctimeMs) throw unavailable();
+    } catch { throw unavailable(); }
+  };
+  return {
+    scan(value: unknown) {
+      const raw = typeof value === 'string' ? value : JSON.stringify(value);
+      if (raw === undefined) return;
+      if (Buffer.byteLength(raw) > config.max_record_bytes) throw new Error('Record screening byte limit exceeded');
+      const input = screeningText(value);
+      if (Buffer.byteLength(input) > config.max_record_bytes) throw new Error('Record screening byte limit exceeded');
+      if (!input.trim()) return;
+      unchanged();
+      const result = spawnSync(config.executable, [
+        'stdin', '--redact', '--no-banner', '--log-level', 'error',
+        '--ignore-gitleaks-allow', '--exit-code', '10', '--report-format', 'json', '--report-path', '-',
+      ], {
+        input, encoding: 'utf8', cwd: directory, shell: false,
+        env: { HOME: directory, USERPROFILE: directory, PATH: path.dirname(config.executable) },
+        timeout: config.timeout_ms, killSignal: 'SIGKILL', maxBuffer: 1_048_576,
+        windowsHide: true,
+      });
+      unchanged();
+      // Exit zero alone is not a clean scan. Validate the full report and never
+      // forward stdout/stderr, findings, fingerprints or input into errors.
+      if (result.error || result.signal || ![0, 10].includes(result.status ?? -1)) throw unavailable();
+      let report: unknown;
+      try { report = JSON.parse(result.stdout); } catch { throw unavailable(); }
+      if (!Array.isArray(report) || (result.status === 0 && report.length !== 0) ||
+          (result.status === 10 && (report.length === 0 || !report.every(item => object(item) && typeof item.RuleID === 'string')))) {
+        throw unavailable();
+      }
+      if (result.status === 10) throw new Error('Record content rejected by screening');
+    },
+    close() { fs.rmSync(directory, { recursive: true, force: true }); },
+  };
+}
+
 export function readRecordExclusions(): RecordExclusions | null {
   const file = path.join(getSuperpowersDir(), 'record-exclusions.json');
   let fd: number | undefined;
@@ -127,8 +224,19 @@ export function readRecordExclusions(): RecordExclusions | null {
     const info = fs.fstatSync(fd);
     if (!info.isFile() || info.size > 4 * 1024 * 1024) throw new Error(POLICY_ERROR);
     const value: unknown = JSON.parse(fs.readFileSync(fd, 'utf8'));
-    if (!object(value) || !keys(value, ['version', 'exchanges', 'tool_calls']) || value.version !== 1 ||
+    if (!object(value) || !keys(value, 'screening' in value
+      ? ['version', 'exchanges', 'tool_calls', 'screening'] : ['version', 'exchanges', 'tool_calls']) || value.version !== 1 ||
         !Array.isArray(value.exchanges) || !Array.isArray(value.tool_calls)) throw new Error(POLICY_ERROR);
+    if ('screening' in value) {
+      const s = value.screening;
+      if (!object(s) || !keys(s, ['engine', 'executable', 'sha256', 'timeout_ms', 'max_record_bytes']) ||
+          s.engine !== 'gitleaks' || typeof s.executable !== 'string' || !path.isAbsolute(s.executable) ||
+          /[\x00-\x1f]/.test(s.executable) || typeof s.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(s.sha256) ||
+          !Number.isSafeInteger(s.timeout_ms) || Number(s.timeout_ms) < 50 || Number(s.timeout_ms) > 30_000 ||
+          !Number.isSafeInteger(s.max_record_bytes) || Number(s.max_record_bytes) < 1 || Number(s.max_record_bytes) > 8_388_608) {
+        throw new Error(POLICY_ERROR);
+      }
+    }
     for (const row of value.exchanges) {
       if (!object(row) || !keys(row, ['session_id', 'transcript', 'line_start', 'line_end']) || !identity(row.session_id) || !transcriptName(row.transcript) ||
           !Number.isSafeInteger(row.line_start) || !Number.isSafeInteger(row.line_end) ||
@@ -195,6 +303,7 @@ async function* admittedRecords(file: string, policy: RecordExclusions | null): 
   const input = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
   const initial = fs.fstatSync(input);
   let stream: fs.ReadStream | undefined;
+  let screener: ReturnType<typeof createRecordScreener> | undefined;
   const decoder = new TextDecoder('utf-8', { fatal: true });
   let pending = Buffer.alloc(0);
   let sessionId = sessionFromPath(file);
@@ -213,13 +322,16 @@ async function* admittedRecords(file: string, policy: RecordExclusions | null): 
       sessionId = recordSession;
       primaryIdentitySeen = true;
     }
-    return { line: filterRecord(line, number, policy, path.basename(file), sessionId), ending: terminated ? (crlf ? '\r\n' : '\n') : '' };
+    const filtered = filterRecord(line, number, policy, path.basename(file), sessionId);
+    screener?.scan(filtered);
+    return { line: filtered, ending: terminated ? (crlf ? '\r\n' : '\n') : '' };
   };
   try {
     // The marker scan and record stream share one descriptor and identity.
     // A path replacement cannot substitute a different unscanned transcript.
     if (descriptorHasExclusionMarker(input)) return;
     assertUnchangedInput(file, initial);
+    screener = createRecordScreener(policy);
     stream = fs.createReadStream(file, { fd: input, autoClose: true, start: 0 });
     for await (const chunk of stream) {
       assertUnchangedInput(file, initial);
@@ -238,6 +350,7 @@ async function* admittedRecords(file: string, policy: RecordExclusions | null): 
   } finally {
     if (stream) stream.destroy();
     else fs.closeSync(input);
+    screener?.close();
   }
 }
 
@@ -261,11 +374,20 @@ export function admitExchange(exchange: ConversationExchange, policy = readRecor
   // Historical Codex rows may carry a fork ancestor's ID. Neither that metadata
   // nor the filename may override a denial bound to the other known identity.
   const sessionIds = [exchange.sessionId, sessionFromPath(exchange.archivePath)].filter((id): id is string => !!id);
-  if (!sessionIds.length) return exchange;
   const transcript = path.basename(exchange.archivePath);
   if (policy.exchanges.some(x => sessionIds.includes(x.session_id) && x.transcript === transcript && exchange.lineStart <= x.line_end && exchange.lineEnd >= x.line_start)) return null;
   const kept = exchange.toolCalls?.filter(call => !sessionIds.some(id => blockedCall(policy, id, transcript, call.id)));
-  return kept && kept.length !== exchange.toolCalls?.length ? { ...exchange, toolCalls: kept } : exchange;
+  const admitted = kept && kept.length !== exchange.toolCalls?.length ? { ...exchange, toolCalls: kept } : exchange;
+  const screener = createRecordScreener(policy);
+  try {
+    // These are separate original records, not one keyword-prefilter fragment.
+    screener.scan(admitted.userMessage);
+    screener.scan(admitted.assistantMessage);
+    for (const call of admitted.toolCalls ?? []) screener.scan(call);
+    const { userMessage, assistantMessage, toolCalls, ...metadata } = admitted;
+    screener.scan(metadata);
+    return admitted;
+  } finally { screener.close(); }
 }
 
 /** Publish only admitted bytes. Never write an unfiltered temporary copy. */

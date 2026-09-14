@@ -24,6 +24,13 @@ export interface RecordExclusions {
     version: 1;
     exchanges: ExchangeExclusion[];
     tool_calls: ToolExclusion[];
+    screening?: {
+        engine: 'gitleaks';
+        executable: string;
+        sha256: string;
+        timeout_ms: number;
+        max_record_bytes: number;
+    };
 }
 export declare function readRecordExclusions(): RecordExclusions | null;
 export declare function excludedSession(policy: RecordExclusions | null, sessionId?: string): boolean;

@@ -35036,6 +35036,9 @@ import Database from "better-sqlite3";
 // src/record-admission.ts
 import fs2 from "node:fs";
 import path2 from "node:path";
+import crypto from "node:crypto";
+import os2 from "node:os";
+import { spawnSync } from "node:child_process";
 import { StringDecoder } from "node:string_decoder";
 
 // src/constants.ts
@@ -35142,6 +35145,115 @@ function transcriptName(value) {
 function identity(value) {
   return typeof value === "string" && value.length > 0 && value.length <= 512 && !/[\x00-\x1f]/.test(value);
 }
+function screeningText(value, depth = 0) {
+  if (depth > 24) throw new Error("Record screening nesting limit exceeded");
+  if (typeof value === "string") {
+    let decoded;
+    try {
+      decoded = JSON.parse(value);
+    } catch {
+      return value;
+    }
+    if (typeof decoded === "string" || object3(decoded) || Array.isArray(decoded)) {
+      return screeningText(decoded, depth + 1);
+    }
+    return value;
+  }
+  if (Array.isArray(value)) return value.map((item) => screeningText(item, depth + 1)).join("\n");
+  if (object3(value)) {
+    return Object.entries(value).map(([key, item]) => `${key} = ${screeningText(item, depth + 1)}`).join("\n");
+  }
+  return value == null ? "" : String(value);
+}
+function createRecordScreener(policy) {
+  const config2 = policy?.screening;
+  if (!config2) return { scan() {
+  }, close() {
+  } };
+  const unavailable = () => new Error("Record screening unavailable");
+  let initial;
+  let fd;
+  try {
+    if (fs2.realpathSync(config2.executable) !== config2.executable) throw unavailable();
+    fd = fs2.openSync(config2.executable, fs2.constants.O_RDONLY | fs2.constants.O_NOFOLLOW);
+    initial = fs2.fstatSync(fd);
+    if (!initial.isFile() || initial.size < 1 || initial.size > 134217728 || (initial.mode & 18) !== 0 || typeof process.getuid === "function" && initial.uid !== 0 && initial.uid !== process.getuid()) {
+      throw unavailable();
+    }
+    fs2.accessSync(config2.executable, fs2.constants.X_OK);
+    const digest = crypto.createHash("sha256").update(fs2.readFileSync(fd)).digest("hex");
+    if (digest !== config2.sha256) throw unavailable();
+  } catch {
+    throw unavailable();
+  } finally {
+    if (fd !== void 0) fs2.closeSync(fd);
+  }
+  let directory;
+  try {
+    directory = fs2.mkdtempSync(path2.join(os2.tmpdir(), "episodic-screen-"));
+    fs2.chmodSync(directory, 448);
+  } catch {
+    throw unavailable();
+  }
+  const unchanged = () => {
+    try {
+      const current = fs2.lstatSync(config2.executable);
+      if (!current.isFile() || current.dev !== initial.dev || current.ino !== initial.ino || current.size !== initial.size || current.mtimeMs !== initial.mtimeMs || current.ctimeMs !== initial.ctimeMs) throw unavailable();
+    } catch {
+      throw unavailable();
+    }
+  };
+  return {
+    scan(value) {
+      const raw = typeof value === "string" ? value : JSON.stringify(value);
+      if (raw === void 0) return;
+      if (Buffer.byteLength(raw) > config2.max_record_bytes) throw new Error("Record screening byte limit exceeded");
+      const input2 = screeningText(value);
+      if (Buffer.byteLength(input2) > config2.max_record_bytes) throw new Error("Record screening byte limit exceeded");
+      if (!input2.trim()) return;
+      unchanged();
+      const result = spawnSync(config2.executable, [
+        "stdin",
+        "--redact",
+        "--no-banner",
+        "--log-level",
+        "error",
+        "--ignore-gitleaks-allow",
+        "--exit-code",
+        "10",
+        "--report-format",
+        "json",
+        "--report-path",
+        "-"
+      ], {
+        input: input2,
+        encoding: "utf8",
+        cwd: directory,
+        shell: false,
+        env: { HOME: directory, USERPROFILE: directory, PATH: path2.dirname(config2.executable) },
+        timeout: config2.timeout_ms,
+        killSignal: "SIGKILL",
+        maxBuffer: 1048576,
+        windowsHide: true
+      });
+      unchanged();
+      if (result.error || result.signal || ![0, 10].includes(result.status ?? -1)) throw unavailable();
+      let report;
+      try {
+        report = JSON.parse(result.stdout);
+      } catch {
+        throw unavailable();
+      }
+      if (!Array.isArray(report) || result.status === 0 && report.length !== 0 || result.status === 10 && (report.length === 0 || !report.every((item) => object3(item) && typeof item.RuleID === "string"))) {
+        throw unavailable();
+      }
+      if (result.status === 10) throw new Error("Record content rejected by screening");
+    },
+    close() {
+      fs2.rmSync(directory, { recursive: true, force: true });
+    }
+  };
+}
 function readRecordExclusions() {
   const file2 = path2.join(getSuperpowersDir(), "record-exclusions.json");
   let fd;
@@ -35150,7 +35262,13 @@ function readRecordExclusions() {
     const info = fs2.fstatSync(fd);
     if (!info.isFile() || info.size > 4 * 1024 * 1024) throw new Error(POLICY_ERROR);
     const value = JSON.parse(fs2.readFileSync(fd, "utf8"));
-    if (!object3(value) || !keys(value, ["version", "exchanges", "tool_calls"]) || value.version !== 1 || !Array.isArray(value.exchanges) || !Array.isArray(value.tool_calls)) throw new Error(POLICY_ERROR);
+    if (!object3(value) || !keys(value, "screening" in value ? ["version", "exchanges", "tool_calls", "screening"] : ["version", "exchanges", "tool_calls"]) || value.version !== 1 || !Array.isArray(value.exchanges) || !Array.isArray(value.tool_calls)) throw new Error(POLICY_ERROR);
+    if ("screening" in value) {
+      const s = value.screening;
+      if (!object3(s) || !keys(s, ["engine", "executable", "sha256", "timeout_ms", "max_record_bytes"]) || s.engine !== "gitleaks" || typeof s.executable !== "string" || !path2.isAbsolute(s.executable) || /[\x00-\x1f]/.test(s.executable) || typeof s.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(s.sha256) || !Number.isSafeInteger(s.timeout_ms) || Number(s.timeout_ms) < 50 || Number(s.timeout_ms) > 3e4 || !Number.isSafeInteger(s.max_record_bytes) || Number(s.max_record_bytes) < 1 || Number(s.max_record_bytes) > 8388608) {
+        throw new Error(POLICY_ERROR);
+      }
+    }
     for (const row of value.exchanges) {
       if (!object3(row) || !keys(row, ["session_id", "transcript", "line_start", "line_end"]) || !identity(row.session_id) || !transcriptName(row.transcript) || !Number.isSafeInteger(row.line_start) || !Number.isSafeInteger(row.line_end) || row.line_start < 1 || row.line_end < row.line_start) throw new Error(POLICY_ERROR);
     }
@@ -35209,6 +35327,7 @@ async function* admittedRecords(file2, policy) {
   const input2 = fs2.openSync(file2, fs2.constants.O_RDONLY | fs2.constants.O_NOFOLLOW);
   const initial = fs2.fstatSync(input2);
   let stream;
+  let screener;
   const decoder = new TextDecoder("utf-8", { fatal: true });
   let pending = Buffer.alloc(0);
   let sessionId = sessionFromPath(file2);
@@ -35230,11 +35349,14 @@ async function* admittedRecords(file2, policy) {
       sessionId = recordSession;
       primaryIdentitySeen = true;
     }
-    return { line: filterRecord(line, number4, policy, path2.basename(file2), sessionId), ending: terminated ? crlf ? "\r\n" : "\n" : "" };
+    const filtered = filterRecord(line, number4, policy, path2.basename(file2), sessionId);
+    screener?.scan(filtered);
+    return { line: filtered, ending: terminated ? crlf ? "\r\n" : "\n" : "" };
   };
   try {
     if (descriptorHasExclusionMarker(input2)) return;
     assertUnchangedInput(file2, initial);
+    screener = createRecordScreener(policy);
     stream = fs2.createReadStream(file2, { fd: input2, autoClose: true, start: 0 });
     for await (const chunk of stream) {
       assertUnchangedInput(file2, initial);
@@ -35253,6 +35375,7 @@ async function* admittedRecords(file2, policy) {
   } finally {
     if (stream) stream.destroy();
     else fs2.closeSync(input2);
+    screener?.close();
   }
 }
 async function* admittedConversationLines(file2, policy = readRecordExclusions()) {
@@ -37674,7 +37797,7 @@ function formatCursorConversationAsMarkdown(lines) {
 }
 
 // src/version.ts
-var VERSION = "1.6.0+codex.20260914110539";
+var VERSION = "1.6.0+codex.20260914152832";
 
 // src/mcp-server.ts
 import fs5 from "fs";

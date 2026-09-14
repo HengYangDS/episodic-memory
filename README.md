@@ -500,8 +500,52 @@ The shipped dependency lock is authoritative for bootstrap: the native install
 runner uses `npm ci` when the lock exists. Native install and removal were
 qualified in an isolated home, including clean SQLite/vector/Transformers loads.
 
-This policy is an exclusion mechanism, not a secret detector. It does not prove
-that unknown records are safe, purge preexisting derived data, rewrite original
+### Optional local secret screening
+
+Add an optional `screening` object to the same policy to reject newly detected
+content before derived archive writes, reads, summaries and database insertion:
+
+```json
+"screening": {
+  "engine": "gitleaks",
+  "executable": "/absolute/resolved/path/to/gitleaks",
+  "sha256": "<64 lowercase hex characters from the trusted executable>",
+  "timeout_ms": 2000,
+  "max_record_bytes": 1048576
+}
+```
+
+Keep the existing `version`, `exchanges` and `tool_calls` fields. Install Gitleaks
+through the host's managed package source (Homebrew first on this workstation),
+resolve its executable symlink and verify its provenance before pinning its
+SHA-256. On migration or upgrade, explicitly replace the host-local path and
+digest after verifying the new executable. The scanner must be a regular,
+executable file owned by the current user or root and not group/world-writable.
+Do not copy credential stores or an old host's executable-path assumption.
+
+Exact exclusions run first. Each remaining physical record is screened locally
+with the pinned Gitleaks built-in rules. Nested JSON strings are decoded while
+retaining key/value assignment context; separate exchange messages are screened
+separately. A finding rejects the operation rather than silently dropping a new
+message and breaking conversation pairing. Missing/changed executables, byte or
+nesting limits, timeouts and malformed or contradictory reports fail closed.
+No findings, input, scanner diagnostics or secret fingerprints appear in errors.
+The scanner receives stdin in a private empty working directory with no inherited
+environment/configuration and with inline allow comments disabled. Its temporary
+directory is removed after execution. Original transcripts and previously
+published archives remain unchanged when admission fails.
+
+Screening launches a bounded subprocess per record; it is not an unbounded bulk
+collection service. Measure a finite representative batch before large imports.
+No automatic sync or background job is enabled by this setting. Before enabling
+it, replace all policy consumers with this version through their native lifecycle:
+older strict-schema consumers reject the additional field. Installing a plugin
+does not replace already-loaded code, so do not enable the field while protected
+old consumers still require the previous schema.
+
+Without `screening`, this policy remains an exact exclusion mechanism. Even with
+screening, pattern matching does not prove universal unknown-secret absence,
+purge preexisting derived data, rewrite original
 sessions, or retroactively filter already-loaded code. Old randomly generated
 tool-row IDs need verified native source-call mapping before policy migration;
 do not broaden those entries to whole sessions or claim a complete migration.
