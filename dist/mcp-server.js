@@ -35039,7 +35039,6 @@ import path2 from "node:path";
 import crypto from "node:crypto";
 import os2 from "node:os";
 import { spawnSync } from "node:child_process";
-import { StringDecoder } from "node:string_decoder";
 
 // src/constants.ts
 var SUMMARIZER_CONTEXT_MARKER = "Context: This summary will be shown in a list to help users and Claude choose which conversations are relevant";
@@ -35091,34 +35090,57 @@ function shouldSkipConversation(filePath) {
   let fd;
   try {
     fd = fs2.openSync(filePath, fs2.constants.O_RDONLY | fs2.constants.O_NOFOLLOW);
-    return descriptorHasExclusionMarker(fd);
+    const initial = fs2.fstatSync(fd);
+    const excluded = descriptorHasExclusionMarker(fd);
+    assertUnchangedInput(filePath, initial);
+    return excluded;
   } catch {
     return true;
   } finally {
-    if (fd !== void 0) {
-      try {
-        fs2.closeSync(fd);
-      } catch {
-      }
-    }
+    if (fd !== void 0) fs2.closeSync(fd);
   }
+}
+function instructionText(record2) {
+  if (!object3(record2)) return "";
+  if (record2.type === "event_msg" && object3(record2.payload)) {
+    return record2.payload.type === "user_message" && typeof record2.payload.message === "string" ? record2.payload.message : "";
+  }
+  const message = record2.type === "response_item" ? record2.payload : record2.message;
+  if (!object3(message) || (message.role ?? record2.role) !== "user") return "";
+  const content = record2.type === "opencode_message" ? record2.parts : message.content;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.filter((part) => object3(part) && ["text", "input_text"].includes(String(part.type)) && typeof part.text === "string").map((part) => part.text).join("\n");
 }
 function descriptorHasExclusionMarker(fd) {
   if (!fs2.fstatSync(fd).isFile()) throw new Error("Conversation input must be a regular file");
-  const maxMarkerLen = Math.max(...EXCLUSION_MARKERS.map((m2) => m2.length));
-  const buf = Buffer.allocUnsafe(MARKER_SCAN_CHUNK_BYTES);
-  const decoder = new StringDecoder("utf8");
-  let carry = "";
+  const buffer = Buffer.allocUnsafe(MARKER_SCAN_CHUNK_BYTES);
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let pending = Buffer.alloc(0);
   let position = 0;
-  let bytesRead;
-  while ((bytesRead = fs2.readSync(fd, buf, 0, buf.length, position)) > 0) {
-    position += bytesRead;
-    const window = carry + decoder.write(buf.subarray(0, bytesRead));
-    if (EXCLUSION_MARKERS.some((marker) => window.includes(marker))) return true;
-    carry = window.slice(Math.max(0, window.length - (maxMarkerLen - 1)));
+  const excluded = (bytes) => {
+    const line = decoder.decode(bytes);
+    let text;
+    try {
+      text = instructionText(JSON.parse(line));
+    } catch {
+      text = line;
+    }
+    return EXCLUSION_MARKERS.some((marker) => text.includes(marker));
+  };
+  let count;
+  while ((count = fs2.readSync(fd, buffer, 0, buffer.length, position)) > 0) {
+    position += count;
+    pending = Buffer.concat([pending, buffer.subarray(0, count)]);
+    let newline;
+    while ((newline = pending.indexOf(10)) !== -1) {
+      if (newline > 64 * 1024 * 1024) throw new Error("Conversation record exceeds admission byte limit");
+      if (excluded(pending.subarray(0, newline))) return true;
+      pending = pending.subarray(newline + 1);
+    }
+    if (pending.length > 64 * 1024 * 1024) throw new Error("Conversation record exceeds admission byte limit");
   }
-  const tail = carry + decoder.end();
-  return EXCLUSION_MARKERS.some((marker) => tail.includes(marker));
+  return pending.length > 0 && excluded(pending);
 }
 function assertUnchangedInput(file2, initial) {
   const current = fs2.lstatSync(file2);
@@ -35321,7 +35343,7 @@ function filterRecord(line, number4, policy, transcript, sessionId) {
   }
   return line;
 }
-async function* admittedRecords(file2, policy) {
+async function* admittedRecords(file2, policy, startLine = 1, endLine = Infinity) {
   const policySnapshot = JSON.stringify(policy);
   assertUnchangedPolicy(policySnapshot);
   const input2 = fs2.openSync(file2, fs2.constants.O_RDONLY | fs2.constants.O_NOFOLLOW);
@@ -35349,7 +35371,7 @@ async function* admittedRecords(file2, policy) {
       sessionId = recordSession;
       primaryIdentitySeen = true;
     }
-    const filtered = filterRecord(line, number4, policy, path2.basename(file2), sessionId);
+    const filtered = number4 >= startLine && number4 <= endLine ? filterRecord(line, number4, policy, path2.basename(file2), sessionId) : "";
     screener?.scan(filtered);
     return { line: filtered, ending: terminated ? crlf ? "\r\n" : "\n" : "" };
   };
@@ -35378,15 +35400,68 @@ async function* admittedRecords(file2, policy) {
     screener?.close();
   }
 }
-async function* admittedConversationLines(file2, policy = readRecordExclusions()) {
-  if (!fs2.lstatSync(file2).isFile()) throw new Error("Conversation input must be a regular non-symlink file");
-  if (shouldSkipConversation(file2)) return;
-  for await (const record2 of admittedRecords(file2, policy)) yield record2.line;
-}
-async function readAdmittedConversation(file2) {
+async function readAdmittedConversation(file2, startLine = 1, endLine = Infinity) {
+  if (!Number.isSafeInteger(startLine) || startLine < 1 || endLine !== Infinity && (!Number.isSafeInteger(endLine) || endLine < startLine)) {
+    throw new Error("Invalid conversation line range");
+  }
   const lines = [];
-  for await (const line of admittedConversationLines(file2)) lines.push(line);
+  for await (const record2 of admittedRecords(file2, readRecordExclusions(), startLine, endLine)) lines.push(record2.line);
   return lines.join("\n");
+}
+function admitExchange(exchange, policy = readRecordExclusions()) {
+  if (!policy) return exchange;
+  const sessionIds = [exchange.sessionId, sessionFromPath(exchange.archivePath)].filter((id) => !!id);
+  const transcript = path2.basename(exchange.archivePath);
+  if (policy.exchanges.some((x2) => sessionIds.includes(x2.session_id) && x2.transcript === transcript && exchange.lineStart <= x2.line_end && exchange.lineEnd >= x2.line_start)) return null;
+  const kept = exchange.toolCalls?.filter((call) => !sessionIds.some((id) => blockedCall(policy, id, transcript, call.id)));
+  const admitted = kept && kept.length !== exchange.toolCalls?.length ? { ...exchange, toolCalls: kept } : exchange;
+  const screener = createRecordScreener(policy);
+  try {
+    screener.scan(admitted.userMessage);
+    screener.scan(admitted.assistantMessage);
+    for (const call of admitted.toolCalls ?? []) screener.scan(call);
+    const { userMessage, assistantMessage, toolCalls, ...metadata } = admitted;
+    screener.scan(metadata);
+    return admitted;
+  } finally {
+    screener.close();
+  }
+}
+function createSearchAdmission() {
+  const policy = readRecordExclusions();
+  const policySnapshot = JSON.stringify(policy);
+  const files = /* @__PURE__ */ new Map();
+  const checkFile = (file2) => {
+    assertUnchangedPolicy(policySnapshot);
+    const cached2 = files.get(file2);
+    if (cached2) {
+      assertUnchangedInput(file2, cached2.initial);
+      return !cached2.excluded;
+    }
+    const initial = fs2.lstatSync(file2);
+    const excluded = shouldSkipConversation(file2);
+    assertUnchangedInput(file2, initial);
+    files.set(file2, { initial, excluded });
+    return !excluded;
+  };
+  return {
+    admit(exchange) {
+      if (!checkFile(exchange.archivePath)) return null;
+      const admitted = admitExchange(exchange, policy);
+      assertUnchangedPolicy(policySnapshot);
+      return admitted;
+    },
+    summary(exchange, text) {
+      const ids = [exchange.sessionId, sessionFromPath(exchange.archivePath)];
+      const transcript = path2.basename(exchange.archivePath);
+      if (policy && [...policy.exchanges, ...policy.tool_calls].some((row) => row.transcript === transcript && ids.includes(row.session_id))) return void 0;
+      return admitExchange({ ...exchange, userMessage: text, assistantMessage: "", toolCalls: [] }, policy) ? text : void 0;
+    },
+    verify() {
+      assertUnchangedPolicy(policySnapshot);
+      for (const [file2, { initial }] of files) assertUnchangedInput(file2, initial);
+    }
+  };
 }
 
 // src/db.ts
@@ -35756,69 +35831,71 @@ async function searchConversations(query, options = {}) {
   const sidechainClause = includeSidechains ? "" : "AND e.is_sidechain = 0";
   if (after) validateISODate(after, "--after");
   if (before) validateISODate(before, "--before");
+  const admission = createSearchAdmission();
   const db = initDatabase();
+  const admitted = (row) => admission.admit(exchangeFromRow(row)) !== null;
   let results = [];
   const { sql: filterClause, params: filterParams } = buildSearchFilters(options);
-  if (mode === "vector" || mode === "both") {
-    await initEmbeddings();
-    const queryEmbedding = await generateQueryEmbedding(query);
-    const k2 = limit * 3;
-    const stmt = db.prepare(`
-      SELECT
-        ${EXCHANGE_SELECT_COLUMNS},
-        vec.distance
-      FROM vec_exchanges AS vec
-      JOIN exchanges AS e ON vec.id = e.id
-      WHERE vec.embedding MATCH ?
-        AND k = ?
-        ${sidechainClause}
-        ${filterClause}
-      ORDER BY (vec.distance + e.is_sidechain * ?) ASC
-    `);
-    results = stmt.all(
-      Buffer.from(new Float32Array(queryEmbedding).buffer),
-      k2,
-      ...filterParams,
-      SIDECHAIN_DISTANCE_PENALTY
-    );
-    if (results.length > limit) {
-      results = results.slice(0, limit);
-    }
-  }
-  if (mode === "text" || mode === "both") {
-    const { sql: textMatchSql, params: textMatchParams } = buildTextMatchClause(query);
-    const textStmt = db.prepare(`
-      SELECT
-        ${EXCHANGE_SELECT_COLUMNS},
-        0 as distance
-      FROM exchanges AS e
-      WHERE ${textMatchSql}
-        ${sidechainClause}
-        ${filterClause}
-      ORDER BY e.is_sidechain ASC, e.timestamp DESC
-      LIMIT ?
-    `);
-    const textResults = textStmt.all(...textMatchParams, ...filterParams, limit);
-    if (mode === "both") {
-      const seenIds = new Set(results.map((r) => r.id));
-      for (const textResult of textResults) {
-        if (!seenIds.has(textResult.id)) {
-          results.push(textResult);
-        }
+  try {
+    if (mode === "vector" || mode === "both") {
+      await initEmbeddings();
+      const queryEmbedding = await generateQueryEmbedding(query);
+      const stmt = db.prepare(`
+        SELECT ${EXCHANGE_SELECT_COLUMNS},
+          vec_distance_l2(vec.embedding, ?) AS distance
+        FROM vec_exchanges AS vec
+        JOIN exchanges AS e ON vec.id = e.id
+        WHERE 1 = 1 ${sidechainClause} ${filterClause}
+        ORDER BY (distance + e.is_sidechain * ?) ASC
+      `);
+      for (const row of stmt.iterate(
+        Buffer.from(new Float32Array(queryEmbedding).buffer),
+        ...filterParams,
+        SIDECHAIN_DISTANCE_PENALTY
+      )) {
+        if (admitted(row)) results.push(row);
+        if (results.length === limit) break;
       }
-    } else {
-      results = textResults;
     }
+    if (mode === "text" || mode === "both") {
+      const { sql: textMatchSql, params: textMatchParams } = buildTextMatchClause(query);
+      const textStmt = db.prepare(`
+        SELECT
+          ${EXCHANGE_SELECT_COLUMNS},
+          0 as distance
+        FROM exchanges AS e
+        WHERE ${textMatchSql}
+          ${sidechainClause}
+          ${filterClause}
+        ORDER BY e.is_sidechain ASC, e.timestamp DESC
+      `);
+      const textResults = [];
+      for (const row of textStmt.iterate(...textMatchParams, ...filterParams)) {
+        if (admitted(row)) textResults.push(row);
+        if (textResults.length === limit) break;
+      }
+      if (mode === "both") {
+        const seenIds = new Set(results.map((r) => r.id));
+        for (const textResult of textResults) {
+          if (!seenIds.has(textResult.id)) {
+            results.push(textResult);
+          }
+        }
+      } else {
+        results = textResults;
+      }
+    }
+  } finally {
+    db.close();
   }
-  db.close();
-  return results.map((row) => {
+  const output2 = results.map((row) => {
     const exchange = exchangeFromRow(row);
     const summaryPath = row.archive_path.replace(".jsonl", "-summary.txt");
     let summary;
     if (fs4.existsSync(summaryPath)) {
       const raw = fs4.readFileSync(summaryPath, "utf-8");
       if (!isErroredSentinel(raw)) {
-        summary = raw.trim();
+        summary = admission.summary(exchange, raw.trim());
       }
     }
     const snippetText = exchange.userMessage.substring(0, 200).replace(/\s+/g, " ").trim();
@@ -35830,6 +35907,8 @@ async function searchConversations(query, options = {}) {
       summary
     };
   });
+  admission.verify();
+  return output2;
 }
 async function countLines(filePath) {
   try {
@@ -37797,7 +37876,7 @@ function formatCursorConversationAsMarkdown(lines) {
 }
 
 // src/version.ts
-var VERSION = "1.6.0+codex.20260914152832";
+var VERSION = "1.6.0+codex.20260915042249";
 
 // src/mcp-server.ts
 import fs5 from "fs";
@@ -37982,7 +38061,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (!fs5.existsSync(params.path)) {
         throw new Error(`File not found: ${params.path}`);
       }
-      const jsonlContent = await readAdmittedConversation(params.path);
+      const jsonlContent = await readAdmittedConversation(params.path, params.startLine, params.endLine);
       const markdownContent = formatConversationAsMarkdown(
         jsonlContent,
         params.startLine,

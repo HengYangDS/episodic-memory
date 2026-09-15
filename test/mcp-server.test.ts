@@ -87,6 +87,47 @@ describe('MCP search tool', () => {
     }
   });
 
+  it('enforces changed exclusions through the packaged MCP search entrypoint', async () => {
+    const { initDatabase, insertExchange } = await import('../src/db.js');
+    const priorDb = process.env.EPISODIC_MEMORY_DB_PATH;
+    const priorTestDb = process.env.TEST_DB_PATH;
+    const priorConfig = process.env.EPISODIC_MEMORY_CONFIG_DIR;
+    const session = '00000000-1111-4222-8333-444444444444';
+    const file = join(testDir!, `packaged-${session}.jsonl`);
+    const policy = join(testDir!, 'config', 'record-exclusions.json');
+    mkdirSync(join(testDir!, 'config'), { recursive: true });
+    const original = [
+      { type: 'session_meta', payload: { id: session } },
+      { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'packaged-admission-probe' }] } },
+      { type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'safe answer' }] } },
+    ].map(row => JSON.stringify(row)).join('\n');
+    writeFileSync(file, original);
+    try {
+      delete process.env.EPISODIC_MEMORY_DB_PATH;
+      process.env.TEST_DB_PATH = testDbPath;
+      process.env.EPISODIC_MEMORY_CONFIG_DIR = join(testDir!, 'config');
+      const db = initDatabase();
+      insertExchange(db, { id: 'packaged-admission', project: 'fixture', timestamp: '2026-01-01T00:00:00Z',
+        userMessage: 'packaged-admission-probe', assistantMessage: 'safe answer', archivePath: file,
+        lineStart: 2, lineEnd: 3, sessionId: session }, new Array(384).fill(0.1));
+      db.close();
+      const search = () => client.callTool({ name: 'search', arguments: {
+        query: 'packaged-admission-probe', mode: 'text', response_format: 'json', limit: 1,
+      } });
+      expect(JSON.parse(getTextContent((await search()).content as ToolContent[])).count).toBe(1);
+      writeFileSync(policy, JSON.stringify({ version: 1, exchanges: [{ session_id: session,
+        transcript: `packaged-${session}.jsonl`, line_start: 2, line_end: 3 }], tool_calls: [] }));
+      const denied = await search(); expect(denied.isError).toBeFalsy();
+      expect(JSON.parse(getTextContent(denied.content as ToolContent[])).count).toBe(0);
+      expect(readFileSync(file, 'utf8')).toBe(original);
+    } finally {
+      if (priorDb === undefined) delete process.env.EPISODIC_MEMORY_DB_PATH; else process.env.EPISODIC_MEMORY_DB_PATH = priorDb;
+      if (priorTestDb === undefined) delete process.env.TEST_DB_PATH; else process.env.TEST_DB_PATH = priorTestDb;
+      if (priorConfig === undefined) delete process.env.EPISODIC_MEMORY_CONFIG_DIR; else process.env.EPISODIC_MEMORY_CONFIG_DIR = priorConfig;
+      if (existsSync(policy)) unlinkSync(policy);
+    }
+  });
+
   it('advertises search and read tools with single and multi-concept queries', async () => {
     const tools = await client.listTools();
     const searchTool = tools.tools.find((tool) => tool.name === 'search');

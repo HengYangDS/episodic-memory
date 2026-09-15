@@ -2,6 +2,21 @@
 
 Semantic search for Claude Code, Codex, Cursor, opencode, and Oh My Pi (OMP) conversations. Remember past discussions, decisions, and patterns.
 
+## Recall admission
+
+Search rechecks the current record-exclusion policy and configured credential scanner,
+including rows indexed before the policy changed. Excluded hits do not consume the
+requested result limit. A stale whole-conversation summary is omitted if any of its
+source records or tool calls is excluded; safe neighboring exchanges remain searchable.
+
+Conversation opt-out markers are read from decoded user text, including JSON escapes.
+Assistant quotations and tool outputs do not opt out the conversation. Tool-result
+blocks inside a user envelope are still tool output. Malformed legacy text retains
+conservative marker handling, and unreadable or oversized records fail closed.
+Ranged reads retain physical line coordinates without materializing unrelated message bodies.
+Original transcripts are never rewritten. Source and policy changes during a search
+abort the result rather than returning a partially validated view.
+
 ## Testimonial
 
 From an AI coding assistant's perspective:

@@ -292,7 +292,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       // Read and format conversation with optional line range
-      const jsonlContent = await readAdmittedConversation(params.path);
+      const jsonlContent = await readAdmittedConversation(params.path, params.startLine, params.endLine);
       const markdownContent = formatConversationAsMarkdown(
         jsonlContent,
         params.startLine,

@@ -3,7 +3,6 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import os from 'node:os';
 import { spawnSync } from 'node:child_process';
-import { StringDecoder } from 'node:string_decoder';
 import { SUMMARIZER_CONTEXT_MARKER } from './constants.js';
 import type { ConversationExchange } from './types.js';
 import { getSuperpowersDir } from './paths.js';
@@ -16,43 +15,65 @@ const EXCLUSION_MARKERS = [
 
 const MARKER_SCAN_CHUNK_BYTES = 1 << 20; // 1 MiB
 
-/**
- * Stream and scan for any exclusion marker, carrying an overlap between
- * chunks so a marker split across a boundary is still found. A single
- * fs.readFileSync(path, 'utf-8') throws ERR_STRING_TOO_LONG above Node's
- * ~512 MB max string length; the old catch returned false (fail OPEN),
- * silently indexing a file whose DO NOT INDEX marker we never read (#152).
- * Streaming confirms cleanliness at any size, and a real read error now
- * fails CLOSED (skip) rather than open.
- */
+/** Scan decoded instruction records without retaining the whole transcript. */
 export function shouldSkipConversation(filePath: string): boolean {
   let fd: number | undefined;
   try {
     fd = fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
-    return descriptorHasExclusionMarker(fd);
+    const initial = fs.fstatSync(fd);
+    const excluded = descriptorHasExclusionMarker(fd);
+    assertUnchangedInput(filePath, initial);
+    return excluded;
   } catch {
-    return true; // fail closed (#152)
+    return true;
   } finally {
-    if (fd !== undefined) { try { fs.closeSync(fd); } catch {} }
+    if (fd !== undefined) fs.closeSync(fd);
   }
+}
+
+function instructionText(record: unknown): string {
+  if (!object(record)) return '';
+  // Codex records both the response item and its user-message event.
+  if (record.type === 'event_msg' && object(record.payload)) {
+    return record.payload.type === 'user_message' && typeof record.payload.message === 'string'
+      ? record.payload.message : '';
+  }
+  const message = record.type === 'response_item' ? record.payload : record.message;
+  if (!object(message) || (message.role ?? record.role) !== 'user') return '';
+  const content = record.type === 'opencode_message' ? record.parts : message.content;
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  // Claude tool results are wrapped in a user envelope, but are not instructions.
+  return content.filter(part => object(part) && ['text', 'input_text'].includes(String(part.type))
+    && typeof part.text === 'string').map(part => part.text).join('\n');
 }
 
 function descriptorHasExclusionMarker(fd: number): boolean {
   if (!fs.fstatSync(fd).isFile()) throw new Error('Conversation input must be a regular file');
-  const maxMarkerLen = Math.max(...EXCLUSION_MARKERS.map(m => m.length));
-  const buf = Buffer.allocUnsafe(MARKER_SCAN_CHUNK_BYTES);
-  const decoder = new StringDecoder('utf8');
-  let carry = '';
+  const buffer = Buffer.allocUnsafe(MARKER_SCAN_CHUNK_BYTES);
+  const decoder = new TextDecoder('utf-8', { fatal: true });
+  let pending = Buffer.alloc(0);
   let position = 0;
-  let bytesRead: number;
-  while ((bytesRead = fs.readSync(fd, buf, 0, buf.length, position)) > 0) {
-    position += bytesRead;
-    const window = carry + decoder.write(buf.subarray(0, bytesRead));
-    if (EXCLUSION_MARKERS.some(marker => window.includes(marker))) return true;
-    carry = window.slice(Math.max(0, window.length - (maxMarkerLen - 1)));
+  const excluded = (bytes: Buffer) => {
+    const line = decoder.decode(bytes);
+    let text: string;
+    try { text = instructionText(JSON.parse(line)); }
+    catch { text = line; } // Preserve conservative handling of legacy raw transcripts.
+    return EXCLUSION_MARKERS.some(marker => text.includes(marker));
+  };
+  let count: number;
+  while ((count = fs.readSync(fd, buffer, 0, buffer.length, position)) > 0) {
+    position += count;
+    pending = Buffer.concat([pending, buffer.subarray(0, count)]);
+    let newline: number;
+    while ((newline = pending.indexOf(10)) !== -1) {
+      if (newline > 64 * 1024 * 1024) throw new Error('Conversation record exceeds admission byte limit');
+      if (excluded(pending.subarray(0, newline))) return true;
+      pending = pending.subarray(newline + 1);
+    }
+    if (pending.length > 64 * 1024 * 1024) throw new Error('Conversation record exceeds admission byte limit');
   }
-  const tail = carry + decoder.end();
-  return EXCLUSION_MARKERS.some(marker => tail.includes(marker));
+  return pending.length > 0 && excluded(pending);
 }
 
 function assertUnchangedInput(file: string, initial: fs.Stats): void {
@@ -297,7 +318,7 @@ function filterRecord(line: string, number: number, policy: RecordExclusions | n
 }
 
 /** Keep byte delimiters and physical line coordinates stable in derived copies. */
-async function* admittedRecords(file: string, policy: RecordExclusions | null): AsyncGenerator<{ line: string; ending: string }> {
+async function* admittedRecords(file: string, policy: RecordExclusions | null, startLine = 1, endLine = Infinity): AsyncGenerator<{ line: string; ending: string }> {
   const policySnapshot = JSON.stringify(policy);
   assertUnchangedPolicy(policySnapshot);
   const input = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
@@ -322,7 +343,8 @@ async function* admittedRecords(file: string, policy: RecordExclusions | null): 
       sessionId = recordSession;
       primaryIdentitySeen = true;
     }
-    const filtered = filterRecord(line, number, policy, path.basename(file), sessionId);
+    const filtered = number >= startLine && number <= endLine
+      ? filterRecord(line, number, policy, path.basename(file), sessionId) : '';
     screener?.scan(filtered);
     return { line: filtered, ending: terminated ? (crlf ? '\r\n' : '\n') : '' };
   };
@@ -362,9 +384,13 @@ export async function* admittedConversationLines(file: string, policy = readReco
 }
 
 /** Read the admitted display input without changing original physical coordinates. */
-export async function readAdmittedConversation(file: string): Promise<string> {
+export async function readAdmittedConversation(file: string, startLine = 1, endLine = Infinity): Promise<string> {
+  if (!Number.isSafeInteger(startLine) || startLine < 1 ||
+      (endLine !== Infinity && (!Number.isSafeInteger(endLine) || endLine < startLine))) {
+    throw new Error('Invalid conversation line range');
+  }
   const lines: string[] = [];
-  for await (const line of admittedConversationLines(file)) lines.push(line);
+  for await (const record of admittedRecords(file, readRecordExclusions(), startLine, endLine)) lines.push(record.line);
   return lines.join('\n');
 }
 
@@ -445,4 +471,46 @@ export async function archiveAdmittedConversation(source: string, destination: s
     fs.utimesSync(destination, initial.atimeMs / 1000, Math.ceil(initial.mtimeMs) / 1000);
     return true;
   } finally { if (fs.existsSync(temp)) fs.unlinkSync(temp); }
+}
+
+/** Request-local admission: retained search rows are not trusted merely because they were indexed. */
+export function createSearchAdmission() {
+  const policy = readRecordExclusions();
+  const policySnapshot = JSON.stringify(policy);
+  const files = new Map<string, { initial: fs.Stats; excluded: boolean }>();
+  const checkFile = (file: string) => {
+    assertUnchangedPolicy(policySnapshot);
+    const cached = files.get(file);
+    if (cached) {
+      assertUnchangedInput(file, cached.initial);
+      return !cached.excluded;
+    }
+    const initial = fs.lstatSync(file);
+    const excluded = shouldSkipConversation(file);
+    assertUnchangedInput(file, initial);
+    files.set(file, { initial, excluded });
+    return !excluded;
+  };
+  return {
+    admit(exchange: ConversationExchange): ConversationExchange | null {
+      if (!checkFile(exchange.archivePath)) return null;
+      const admitted = admitExchange(exchange, policy);
+      assertUnchangedPolicy(policySnapshot);
+      return admitted;
+    },
+    summary(exchange: ConversationExchange, text: string): string | undefined {
+      // An old summary has no record-level provenance. A filtered source may have
+      // contributed any of its text, so do not expose that derived summary.
+      const ids = [exchange.sessionId, sessionFromPath(exchange.archivePath)];
+      const transcript = path.basename(exchange.archivePath);
+      if (policy && [...policy.exchanges, ...policy.tool_calls].some(row =>
+        row.transcript === transcript && ids.includes(row.session_id))) return undefined;
+      return admitExchange({ ...exchange, userMessage: text, assistantMessage: '', toolCalls: [] }, policy)
+        ? text : undefined;
+    },
+    verify() {
+      assertUnchangedPolicy(policySnapshot);
+      for (const [file, { initial }] of files) assertUnchangedInput(file, initial);
+    },
+  };
 }

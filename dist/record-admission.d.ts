@@ -1,13 +1,5 @@
 import type { ConversationExchange } from './types.js';
-/**
- * Stream and scan for any exclusion marker, carrying an overlap between
- * chunks so a marker split across a boundary is still found. A single
- * fs.readFileSync(path, 'utf-8') throws ERR_STRING_TOO_LONG above Node's
- * ~512 MB max string length; the old catch returned false (fail OPEN),
- * silently indexing a file whose DO NOT INDEX marker we never read (#152).
- * Streaming confirms cleanliness at any size, and a real read error now
- * fails CLOSED (skip) rather than open.
- */
+/** Scan decoded instruction records without retaining the whole transcript. */
 export declare function shouldSkipConversation(filePath: string): boolean;
 interface ExchangeExclusion {
     session_id: string;
@@ -37,9 +29,15 @@ export declare function excludedSession(policy: RecordExclusions | null, session
 /** Read original inputs without mutation, preserving their physical line numbers. */
 export declare function admittedConversationLines(file: string, policy?: RecordExclusions | null): AsyncGenerator<string>;
 /** Read the admitted display input without changing original physical coordinates. */
-export declare function readAdmittedConversation(file: string): Promise<string>;
+export declare function readAdmittedConversation(file: string, startLine?: number, endLine?: number): Promise<string>;
 /** Enforce the same rule for direct callers that bypass transcript parsing. */
 export declare function admitExchange(exchange: ConversationExchange, policy?: RecordExclusions | null): ConversationExchange | null;
 /** Publish only admitted bytes. Never write an unfiltered temporary copy. */
 export declare function archiveAdmittedConversation(source: string, destination: string, policy?: RecordExclusions | null): Promise<boolean>;
+/** Request-local admission: retained search rows are not trusted merely because they were indexed. */
+export declare function createSearchAdmission(): {
+    admit(exchange: ConversationExchange): ConversationExchange | null;
+    summary(exchange: ConversationExchange, text: string): string | undefined;
+    verify(): void;
+};
 export {};

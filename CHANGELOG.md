@@ -1,3 +1,10 @@
+## Local repair — 2026-09-15
+
+- Respect current exclusions in retained text, vector and combined search results.
+- Honor escaped user opt-out instructions without hiding conversations that merely quote markers in tool output.
+- Screen returned content and suppress summaries that may contain excluded source records.
+- Keep safe results available beyond excluded candidates, without the native KNN candidate ceiling.
+
 # Changelog
 
 All notable changes to this project will be documented in this file.

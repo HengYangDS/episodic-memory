@@ -10,6 +10,7 @@ import {
   readRecordExclusions,
 } from '../src/record-admission.js';
 import { initDatabase, insertExchange } from '../src/db.js';
+import { searchConversations } from '../src/search.js';
 import type { ConversationExchange } from '../src/types.js';
 
 const session = '00000000-1111-4222-8333-444444444444';
@@ -84,6 +85,22 @@ afterEach(() => {
 });
 
 describe('pinned record-local screening at native admission', () => {
+  it('screens retained search content and summaries against the current pinned scanner', async () => {
+    const db = initDatabase();
+    insertExchange(db, exchange(), new Array(384).fill(0));
+    db.prepare('UPDATE exchanges SET assistant_message = ?').run(token);
+    db.close();
+    await expect(searchConversations('ordinary', { mode: 'text' })).rejects.toThrow(/content rejected by screening/i);
+    const repaired = initDatabase();
+    repaired.prepare('UPDATE exchanges SET assistant_message = ?').run('safe answer');
+    repaired.close();
+    fs.writeFileSync(source.replace('.jsonl', '-summary.txt'), token);
+    await expect(searchConversations('ordinary', { mode: 'text' })).rejects.toThrow(/content rejected by screening/i);
+    fs.unlinkSync(source.replace('.jsonl', '-summary.txt'));
+    policy({ sha256: '0'.repeat(64) });
+    await expect(searchConversations('ordinary', { mode: 'text' })).rejects.toThrow(/screening unavailable/i);
+  });
+
   it('accepts an explicitly configured scanner without changing exclusion identity', () => {
     expect(readRecordExclusions()).toMatchObject({ version: 1, screening: { engine: 'gitleaks' } });
     expect(admitExchange(exchange())).toEqual(exchange());
