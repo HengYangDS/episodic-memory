@@ -35842,11 +35842,11 @@ async function searchConversations(query, options = {}) {
       const queryEmbedding = await generateQueryEmbedding(query);
       const stmt = db.prepare(`
         SELECT ${EXCHANGE_SELECT_COLUMNS},
-          vec_distance_l2(vec.embedding, ?) AS distance
+          vec_distance_l2(vec.embedding, ?) AS retrieval_distance
         FROM vec_exchanges AS vec
         JOIN exchanges AS e ON vec.id = e.id
         WHERE 1 = 1 ${sidechainClause} ${filterClause}
-        ORDER BY (distance + e.is_sidechain * ?) ASC
+        ORDER BY (retrieval_distance + e.is_sidechain * ?) ASC
       `);
       for (const row of stmt.iterate(
         Buffer.from(new Float32Array(queryEmbedding).buffer),
@@ -35862,7 +35862,7 @@ async function searchConversations(query, options = {}) {
       const textStmt = db.prepare(`
         SELECT
           ${EXCHANGE_SELECT_COLUMNS},
-          0 as distance
+          0 as retrieval_distance
         FROM exchanges AS e
         WHERE ${textMatchSql}
           ${sidechainClause}
@@ -35902,7 +35902,7 @@ async function searchConversations(query, options = {}) {
     const snippet = snippetText + (exchange.userMessage.length > 200 ? "..." : "");
     return {
       exchange,
-      similarity: mode === "text" ? void 0 : l2DistanceToCosineSimilarity(row.distance),
+      similarity: mode === "text" ? void 0 : l2DistanceToCosineSimilarity(row.retrieval_distance),
       snippet,
       summary
     };
@@ -37876,7 +37876,7 @@ function formatCursorConversationAsMarkdown(lines) {
 }
 
 // src/version.ts
-var VERSION = "1.6.0+codex.20260915042249";
+var VERSION = "1.6.0+codex.20260916014656";
 
 // src/mcp-server.ts
 import fs5 from "fs";

@@ -1,3 +1,9 @@
+## Local repair — 2026-09-16
+
+- Return vector matches by computed relevance rather than insertion order.
+- Apply the existing sidechain penalty to actual distances before limiting results.
+- Preserve credential screening, source admission, index contents and the existing encoder.
+
 ## Local repair — 2026-09-15
 
 - Respect current exclusions in retained text, vector and combined search results.

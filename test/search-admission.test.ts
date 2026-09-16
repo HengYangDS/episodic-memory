@@ -83,6 +83,31 @@ describe('decoded user instruction markers', () => {
 });
 
 describe('retained search admission', () => {
+  it('orders admitted vectors by computed distance before applying the result limit', async () => {
+    seed('far'); seed('near'); seed('middle');
+    const db = initDatabase();
+    const update = db.prepare('UPDATE vec_exchanges SET embedding = ? WHERE id = ?');
+    for (const [id, coordinate] of [['far', 0.8], ['near', 0.1], ['middle', 0.3]] as const) {
+      update.run(Buffer.from(new Float32Array(new Array(384).fill(coordinate)).buffer), id);
+    }
+    db.close();
+
+    const results = await searchConversations('needle', { mode: 'vector', limit: 2 });
+    expect(results.map(result => result.exchange.id)).toEqual(['near', 'middle']);
+    expect(results[0].similarity).toBeGreaterThan(results[1].similarity!);
+  });
+
+  it('applies the sidechain penalty to computed distance rather than storage order', async () => {
+    seed('sidechain'); seed('primary');
+    const db = initDatabase();
+    db.prepare('UPDATE exchanges SET is_sidechain = 1 WHERE id = ?').run('sidechain');
+    db.close();
+
+    const results = await searchConversations('needle', { mode: 'vector', limit: 2 });
+    expect(results.map(result => result.exchange.id)).toEqual(['primary', 'sidechain']);
+    expect(results[0].similarity).toBeCloseTo(results[1].similarity!);
+  });
+
   it('finds an admitted vector beyond the native KNN candidate ceiling', async () => {
     const file = seed('denied'); seed('safe');
     const db = initDatabase();

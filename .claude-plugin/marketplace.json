@@ -9,7 +9,7 @@
     {
       "name": "episodic-memory",
       "description": "Semantic search for Claude Code conversations. Remember past discussions, decisions, and patterns.",
-      "version": "1.6.0+codex.20260915042249",
+      "version": "1.6.0+codex.20260916014656",
       "source": "./",
       "author": {
         "name": "Jesse Vincent",
