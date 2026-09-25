@@ -49,7 +49,7 @@ function instructionText(record) {
     return content.filter(part => object(part) && ['text', 'input_text'].includes(String(part.type))
         && typeof part.text === 'string').map(part => part.text).join('\n');
 }
-function descriptorHasExclusionMarker(fd) {
+function descriptorHasExclusionMarker(fd, byteLimit = Infinity, digest) {
     if (!fs.fstatSync(fd).isFile())
         throw new Error('Conversation input must be a regular file');
     const buffer = Buffer.allocUnsafe(MARKER_SCAN_CHUNK_BYTES);
@@ -68,8 +68,9 @@ function descriptorHasExclusionMarker(fd) {
         return EXCLUSION_MARKERS.some(marker => text.includes(marker));
     };
     let count;
-    while ((count = fs.readSync(fd, buffer, 0, buffer.length, position)) > 0) {
+    while (position < byteLimit && (count = fs.readSync(fd, buffer, 0, Math.min(buffer.length, byteLimit - position), position)) > 0) {
         position += count;
+        digest?.update(buffer.subarray(0, count));
         pending = Buffer.concat([pending, buffer.subarray(0, count)]);
         let newline;
         while ((newline = pending.indexOf(10)) !== -1) {
@@ -82,6 +83,8 @@ function descriptorHasExclusionMarker(fd) {
         if (pending.length > 64 * 1024 * 1024)
             throw new Error('Conversation record exceeds admission byte limit');
     }
+    if (position < byteLimit && byteLimit !== Infinity)
+        throw new Error('Conversation changed during record admission');
     return pending.length > 0 && excluded(pending);
 }
 function assertUnchangedInput(file, initial) {
@@ -89,6 +92,52 @@ function assertUnchangedInput(file, initial) {
     if (!current.isFile() || initial.dev !== current.dev || initial.ino !== current.ino ||
         initial.size !== current.size || initial.mtimeMs !== current.mtimeMs || initial.ctimeMs !== current.ctimeMs) {
         throw new Error('Conversation changed during record admission');
+    }
+}
+function assertUnchangedSearchPrefix(file, initial, expectedDigest) {
+    // A live transcript may grow after the search snapshot. Rehash the pinned
+    // prefix only when metadata changes, so appended bytes cannot hide a rewrite.
+    const changed = () => new Error('Conversation changed during record admission');
+    let current;
+    try {
+        current = fs.lstatSync(file);
+    }
+    catch {
+        throw changed();
+    }
+    if (!current.isFile() || initial.dev !== current.dev || initial.ino !== current.ino || current.size < initial.size) {
+        throw changed();
+    }
+    if (current.size === initial.size && current.mtimeMs === initial.mtimeMs && current.ctimeMs === initial.ctimeMs)
+        return;
+    let fd;
+    try {
+        fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+        const opened = fs.fstatSync(fd);
+        if (!opened.isFile() || opened.dev !== initial.dev || opened.ino !== initial.ino || opened.size < initial.size)
+            throw changed();
+        const digest = crypto.createHash('sha256');
+        const buffer = Buffer.allocUnsafe(MARKER_SCAN_CHUNK_BYTES);
+        let position = 0;
+        while (position < initial.size) {
+            const count = fs.readSync(fd, buffer, 0, Math.min(buffer.length, initial.size - position), position);
+            if (count <= 0)
+                throw changed();
+            digest.update(buffer.subarray(0, count));
+            position += count;
+        }
+        if (digest.digest('hex') !== expectedDigest)
+            throw changed();
+        current = fs.lstatSync(file);
+        if (!current.isFile() || current.dev !== initial.dev || current.ino !== initial.ino || current.size < initial.size)
+            throw changed();
+    }
+    catch {
+        throw changed();
+    }
+    finally {
+        if (fd !== undefined)
+            fs.closeSync(fd);
     }
 }
 function assertUnchangedPolicy(expected) {
@@ -530,15 +579,32 @@ export function createSearchAdmission() {
     const checkFile = (file) => {
         assertUnchangedPolicy(policySnapshot);
         const cached = files.get(file);
-        if (cached) {
-            assertUnchangedInput(file, cached.initial);
+        if (cached)
             return !cached.excluded;
+        let fd;
+        try {
+            const pathInfo = fs.lstatSync(file);
+            if (!pathInfo.isFile())
+                throw new Error('Conversation changed during record admission');
+            fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+            const initial = fs.fstatSync(fd);
+            if (!initial.isFile() || initial.dev !== pathInfo.dev || initial.ino !== pathInfo.ino ||
+                !Number.isSafeInteger(initial.size))
+                throw new Error('Conversation changed during record admission');
+            const hash = crypto.createHash('sha256');
+            // The observed size is this request's snapshot boundary. Records appended
+            // later are admitted by the next request, including conversation opt-outs.
+            const excluded = descriptorHasExclusionMarker(fd, initial.size, hash);
+            files.set(file, { initial, excluded, digest: excluded ? undefined : hash.digest('hex') });
+            return !excluded;
         }
-        const initial = fs.lstatSync(file);
-        const excluded = shouldSkipConversation(file);
-        assertUnchangedInput(file, initial);
-        files.set(file, { initial, excluded });
-        return !excluded;
+        catch {
+            throw new Error('Conversation changed during record admission');
+        }
+        finally {
+            if (fd !== undefined)
+                fs.closeSync(fd);
+        }
     };
     return {
         admit(exchange) {
@@ -560,8 +626,11 @@ export function createSearchAdmission() {
         },
         verify() {
             assertUnchangedPolicy(policySnapshot);
-            for (const [file, { initial }] of files)
-                assertUnchangedInput(file, initial);
+            for (const [file, { initial, digest }] of files) {
+                if (digest !== undefined)
+                    assertUnchangedSearchPrefix(file, initial, digest);
+            }
+            assertUnchangedPolicy(policySnapshot);
         },
     };
 }

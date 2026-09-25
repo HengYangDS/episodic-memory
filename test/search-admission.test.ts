@@ -130,6 +130,45 @@ describe('retained search admission', () => {
     fs.symlinkSync(file + '.original', file);
     await expect(searchConversations('needle', { mode: 'text' })).rejects.toThrow(/changed during record admission/);
   });
+  it('keeps an indexed exchange searchable while its transcript grows during admission', async () => {
+    const file = seed('safe');
+    const original = fs.readSync;
+    let appended = false;
+    vi.spyOn(fs, 'readSync').mockImplementation(((...args: Parameters<typeof fs.readSync>) => {
+      const count = original(...args);
+      if (!appended && count > 0) {
+        appended = true;
+        fs.appendFileSync(file, JSON.stringify({ type: 'event_msg', payload: { type: 'agent_message', message: 'later' } }) + '\n');
+      }
+      return count;
+    }) as typeof fs.readSync);
+
+    const results = await searchConversations('needle', { mode: 'text', before: '2026-09-14' });
+    expect(appended).toBe(true);
+    expect(results.map(result => result.exchange.id)).toEqual(['safe']);
+  });
+  it('rejects an indexed-range rewrite even when the transcript also grows', async () => {
+    const file = seed('safe');
+    const summary = file.replace('.jsonl', '-summary.txt');
+    fs.writeFileSync(summary, 'summary');
+    const offset = fs.readFileSync(file).indexOf('needle safe');
+    expect(offset).toBeGreaterThanOrEqual(0);
+    const original = fs.readFileSync;
+    let changed = false;
+    vi.spyOn(fs, 'readFileSync').mockImplementation(((p: any, ...args: any[]) => {
+      if (p === summary && !changed) {
+        changed = true;
+        fs.appendFileSync(file, JSON.stringify({ type: 'event_msg', payload: { type: 'agent_message', message: 'later' } }) + '\n');
+        const fd = fs.openSync(file, 'r+');
+        try { fs.writeSync(fd, Buffer.from('secret safe'), 0, 11, offset); }
+        finally { fs.closeSync(fd); }
+      }
+      return (original as any)(p, ...args);
+    }) as typeof fs.readFileSync);
+
+    await expect(searchConversations('needle', { mode: 'text' })).rejects.toThrow(/changed during record admission/);
+    expect(changed).toBe(true);
+  });
   it('rejects policy changes while building results', async () => {
     const file = seed('safe');
     const summary = file.replace('.jsonl', '-summary.txt'); fs.writeFileSync(summary, 'summary');

@@ -35086,20 +35086,6 @@ var EXCLUSION_MARKERS = [
   SUMMARIZER_CONTEXT_MARKER
 ];
 var MARKER_SCAN_CHUNK_BYTES = 1 << 20;
-function shouldSkipConversation(filePath) {
-  let fd;
-  try {
-    fd = fs2.openSync(filePath, fs2.constants.O_RDONLY | fs2.constants.O_NOFOLLOW);
-    const initial = fs2.fstatSync(fd);
-    const excluded = descriptorHasExclusionMarker(fd);
-    assertUnchangedInput(filePath, initial);
-    return excluded;
-  } catch {
-    return true;
-  } finally {
-    if (fd !== void 0) fs2.closeSync(fd);
-  }
-}
 function instructionText(record2) {
   if (!object3(record2)) return "";
   if (record2.type === "event_msg" && object3(record2.payload)) {
@@ -35112,7 +35098,7 @@ function instructionText(record2) {
   if (!Array.isArray(content)) return "";
   return content.filter((part) => object3(part) && ["text", "input_text"].includes(String(part.type)) && typeof part.text === "string").map((part) => part.text).join("\n");
 }
-function descriptorHasExclusionMarker(fd) {
+function descriptorHasExclusionMarker(fd, byteLimit = Infinity, digest) {
   if (!fs2.fstatSync(fd).isFile()) throw new Error("Conversation input must be a regular file");
   const buffer = Buffer.allocUnsafe(MARKER_SCAN_CHUNK_BYTES);
   const decoder = new TextDecoder("utf-8", { fatal: true });
@@ -35129,8 +35115,9 @@ function descriptorHasExclusionMarker(fd) {
     return EXCLUSION_MARKERS.some((marker) => text.includes(marker));
   };
   let count;
-  while ((count = fs2.readSync(fd, buffer, 0, buffer.length, position)) > 0) {
+  while (position < byteLimit && (count = fs2.readSync(fd, buffer, 0, Math.min(buffer.length, byteLimit - position), position)) > 0) {
     position += count;
+    digest?.update(buffer.subarray(0, count));
     pending = Buffer.concat([pending, buffer.subarray(0, count)]);
     let newline;
     while ((newline = pending.indexOf(10)) !== -1) {
@@ -35140,12 +35127,48 @@ function descriptorHasExclusionMarker(fd) {
     }
     if (pending.length > 64 * 1024 * 1024) throw new Error("Conversation record exceeds admission byte limit");
   }
+  if (position < byteLimit && byteLimit !== Infinity) throw new Error("Conversation changed during record admission");
   return pending.length > 0 && excluded(pending);
 }
 function assertUnchangedInput(file2, initial) {
   const current = fs2.lstatSync(file2);
   if (!current.isFile() || initial.dev !== current.dev || initial.ino !== current.ino || initial.size !== current.size || initial.mtimeMs !== current.mtimeMs || initial.ctimeMs !== current.ctimeMs) {
     throw new Error("Conversation changed during record admission");
+  }
+}
+function assertUnchangedSearchPrefix(file2, initial, expectedDigest) {
+  const changed = () => new Error("Conversation changed during record admission");
+  let current;
+  try {
+    current = fs2.lstatSync(file2);
+  } catch {
+    throw changed();
+  }
+  if (!current.isFile() || initial.dev !== current.dev || initial.ino !== current.ino || current.size < initial.size) {
+    throw changed();
+  }
+  if (current.size === initial.size && current.mtimeMs === initial.mtimeMs && current.ctimeMs === initial.ctimeMs) return;
+  let fd;
+  try {
+    fd = fs2.openSync(file2, fs2.constants.O_RDONLY | fs2.constants.O_NOFOLLOW);
+    const opened = fs2.fstatSync(fd);
+    if (!opened.isFile() || opened.dev !== initial.dev || opened.ino !== initial.ino || opened.size < initial.size) throw changed();
+    const digest = crypto.createHash("sha256");
+    const buffer = Buffer.allocUnsafe(MARKER_SCAN_CHUNK_BYTES);
+    let position = 0;
+    while (position < initial.size) {
+      const count = fs2.readSync(fd, buffer, 0, Math.min(buffer.length, initial.size - position), position);
+      if (count <= 0) throw changed();
+      digest.update(buffer.subarray(0, count));
+      position += count;
+    }
+    if (digest.digest("hex") !== expectedDigest) throw changed();
+    current = fs2.lstatSync(file2);
+    if (!current.isFile() || current.dev !== initial.dev || current.ino !== initial.ino || current.size < initial.size) throw changed();
+  } catch {
+    throw changed();
+  } finally {
+    if (fd !== void 0) fs2.closeSync(fd);
   }
 }
 function assertUnchangedPolicy(expected) {
@@ -35434,15 +35457,23 @@ function createSearchAdmission() {
   const checkFile = (file2) => {
     assertUnchangedPolicy(policySnapshot);
     const cached2 = files.get(file2);
-    if (cached2) {
-      assertUnchangedInput(file2, cached2.initial);
-      return !cached2.excluded;
+    if (cached2) return !cached2.excluded;
+    let fd;
+    try {
+      const pathInfo = fs2.lstatSync(file2);
+      if (!pathInfo.isFile()) throw new Error("Conversation changed during record admission");
+      fd = fs2.openSync(file2, fs2.constants.O_RDONLY | fs2.constants.O_NOFOLLOW);
+      const initial = fs2.fstatSync(fd);
+      if (!initial.isFile() || initial.dev !== pathInfo.dev || initial.ino !== pathInfo.ino || !Number.isSafeInteger(initial.size)) throw new Error("Conversation changed during record admission");
+      const hash2 = crypto.createHash("sha256");
+      const excluded = descriptorHasExclusionMarker(fd, initial.size, hash2);
+      files.set(file2, { initial, excluded, digest: excluded ? void 0 : hash2.digest("hex") });
+      return !excluded;
+    } catch {
+      throw new Error("Conversation changed during record admission");
+    } finally {
+      if (fd !== void 0) fs2.closeSync(fd);
     }
-    const initial = fs2.lstatSync(file2);
-    const excluded = shouldSkipConversation(file2);
-    assertUnchangedInput(file2, initial);
-    files.set(file2, { initial, excluded });
-    return !excluded;
   };
   return {
     admit(exchange) {
@@ -35459,7 +35490,10 @@ function createSearchAdmission() {
     },
     verify() {
       assertUnchangedPolicy(policySnapshot);
-      for (const [file2, { initial }] of files) assertUnchangedInput(file2, initial);
+      for (const [file2, { initial, digest }] of files) {
+        if (digest !== void 0) assertUnchangedSearchPrefix(file2, initial, digest);
+      }
+      assertUnchangedPolicy(policySnapshot);
     }
   };
 }
