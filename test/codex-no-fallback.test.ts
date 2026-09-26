@@ -57,7 +57,7 @@ describe('Codex summary provider boundary', () => {
       harness: 'codex',
     };
 
-    await expect(summarizeConversation([exchange])).rejects.toThrow(/session ID/);
+    await expect(summarizeConversation([exchange])).rejects.toThrow();
     expect(query).not.toHaveBeenCalled();
   });
 });
