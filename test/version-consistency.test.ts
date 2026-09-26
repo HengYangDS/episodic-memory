@@ -27,4 +27,10 @@ describe('version sources of truth', () => {
     const marketplace = readJson('.claude-plugin/marketplace.json');
     expect(marketplace.plugins[0].version).toBe(pkg.version);
   });
+
+  it('package-lock root versions equal package.json version', () => {
+    const lock = readJson('package-lock.json');
+    expect(lock.version).toBe(pkg.version);
+    expect(lock.packages[''].version).toBe(pkg.version);
+  });
 });

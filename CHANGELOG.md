@@ -1,3 +1,8 @@
+## Local integration — 2026-09-26
+
+- Integrate upstream PRs #176–#180 for high-water indexing, verifier classification, Codex-only summaries, durable model caching, and record admission.
+- Keep the personal plugin manifest, locked dependency tree, and offline-by-default model policy as local deployment choices.
+
 ## Local repair — 2026-09-16
 
 - Return vector matches by computed relevance rather than insertion order.
