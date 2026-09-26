@@ -1,4 +1,7 @@
 import fs from 'fs';
+import os from 'node:os';
+import path from 'node:path';
+import { admitExchange, readRecordExclusions } from './record-admission.js';
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import { SUMMARIZER_CONTEXT_MARKER } from './constants.js';
 import { VERSION } from './version.js';
@@ -362,12 +365,27 @@ Bad:
 }
 export function buildCodexSummarizerCommand(args) {
     const command = args.codexBin || process.env.EPISODIC_MEMORY_CODEX_BIN || 'codex';
+    if (args.isolated && args.sessionId)
+        throw new Error('An isolated summary cannot resume a source session');
+    const restrictions = args.isolated ? [
+        ...['shell_tool', 'unified_exec', 'shell_snapshot', 'apps', 'plugins', 'remote_plugin',
+            'hooks', 'multi_agent', 'multi_agent_v2', 'memories', 'goals', 'computer_use',
+            'browser_use', 'browser_use_external', 'image_generation', 'workspace_dependencies',
+            'skill_search', 'skill_mcp_dependency_install', 'tool_suggest', 'code_mode_host',
+            'sleep_tool', 'view_image', 'default_mode_request_user_input']
+            .map(feature => `features.${feature}=false`),
+        'features.skip_host_skill_discovery=true', 'skills.bundled.enabled=false',
+        'skills.include_instructions=false', 'project_doc_max_bytes=0',
+        'tools.experimental_request_user_input.enabled=false', 'web_search="disabled"',
+        'history.persistence="none"',
+    ].flatMap(value => ['-c', value]) : [];
     return {
         command,
-        args: ['app-server'],
+        args: ['app-server', ...restrictions],
         prompt: args.prompt,
         sessionId: args.sessionId,
         model: args.model,
+        ...(args.isolated ? { isolated: true } : {}),
     };
 }
 async function callClaude(prompt, sessionId, useFallback = false, cwd) {
@@ -421,6 +439,9 @@ async function assertSupportedCodexVersion(command) {
     }
     const output = await readCommandOutput(command.command, command.versionArgs || ['--version']);
     const version = parseCodexCliVersion(output);
+    if (command.isolated && (!version || !versionMeetsMinimum(version, '0.154.0'))) {
+        throw new Error('Isolated record-policy summarization requires codex-cli >= 0.154.0');
+    }
     if (!version || !versionMeetsMinimum(version)) {
         throw new Error(codexVersionRequirementMessage(output));
     }
@@ -440,10 +461,16 @@ function requireTurnId(result, method) {
     return turnId;
 }
 export async function runCodexCommand(command) {
+    if (command.isolated && command.sessionId)
+        throw new Error('An isolated summary cannot resume a source session');
     await assertSupportedCodexVersion(command);
+    const summaryCwd = command.isolated
+        ? fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'episodic-memory-summary-')))
+        : undefined;
     return new Promise((resolve, reject) => {
         const child = spawn(command.command, command.args, {
             env: getApiEnv(),
+            ...(summaryCwd ? { cwd: summaryCwd } : {}),
             stdio: ['pipe', 'pipe', 'pipe']
         });
         let stderr = '';
@@ -451,6 +478,7 @@ export async function runCodexCommand(command) {
         let nextRequestId = 1;
         let targetTurnId;
         let finished = false;
+        let terminalOutcome;
         let timeout;
         const pending = new Map();
         const lines = createInterface({ input: child.stdout });
@@ -471,6 +499,12 @@ export async function runCodexCommand(command) {
                 return;
             finished = true;
             cleanup();
+            if (command.isolated) {
+                // Wait for process termination before removing its owned directory.
+                // Provider payloads may repeat input; never persist them in error sidecars.
+                terminalOutcome = { error: error ? new Error('Isolated Codex summary failed; provider details suppressed') : undefined, result };
+                return;
+            }
             if (error) {
                 reject(error);
             }
@@ -544,6 +578,23 @@ export async function runCodexCommand(command) {
                 finish(new Error(detail));
             }
         });
+        child.on('close', () => {
+            if (!command.isolated)
+                return;
+            try {
+                if (summaryCwd)
+                    fs.rmSync(summaryCwd, { recursive: true, force: true });
+                if (terminalOutcome?.error)
+                    reject(terminalOutcome.error);
+                else if (terminalOutcome)
+                    resolve(terminalOutcome.result);
+                else
+                    reject(new Error('Isolated Codex summary ended without a terminal result'));
+            }
+            catch {
+                reject(new Error('Isolated Codex summary cleanup failed'));
+            }
+        });
         (async () => {
             try {
                 await send('initialize', {
@@ -557,15 +608,45 @@ export async function runCodexCommand(command) {
                     },
                 });
                 notify('initialized');
-                const fork = await send('thread/fork', {
-                    threadId: command.sessionId,
+                let isolation = {};
+                if (command.isolated) {
+                    const configured = await send('config/read', { includeLayers: false });
+                    const servers = configured?.config?.mcp_servers;
+                    if (!configured?.config || servers !== undefined && (!servers || typeof servers !== 'object' || Array.isArray(servers))) {
+                        throw new Error('Cannot establish configured MCP boundary');
+                    }
+                    const listed = await send('skills/list', { cwds: [summaryCwd], forceReload: true });
+                    if (!Array.isArray(listed?.data) || listed.data.some((entry) => !Array.isArray(entry.skills) || !Array.isArray(entry.errors) || entry.errors.length)) {
+                        throw new Error('Cannot establish configured skill boundary');
+                    }
+                    const skills = listed.data.flatMap((entry) => entry.skills).map((skill) => {
+                        if (typeof skill.path !== 'string' || !path.isAbsolute(skill.path))
+                            throw new Error('Invalid configured skill identity');
+                        return { path: skill.path, enabled: false };
+                    });
+                    isolation = {
+                        cwd: summaryCwd,
+                        dynamicTools: [], environments: [], selectedCapabilityRoots: [],
+                        allowProviderModelFallback: false,
+                        baseInstructions: 'Summarize only the admitted transcript. Do not use tools or recover external context.',
+                        developerInstructions: 'Output only a concise factual summary inside <summary></summary>.',
+                        config: {
+                            mcp_servers: Object.fromEntries(Object.keys(servers ?? {}).map(name => [name, { enabled: false }])),
+                            'skills.config': skills,
+                        },
+                    };
+                }
+                const method = command.sessionId ? 'thread/fork' : 'thread/start';
+                const fork = await send(method, {
+                    ...(command.sessionId ? { threadId: command.sessionId } : {}),
                     ephemeral: true,
                     excludeTurns: true,
                     sandbox: 'read-only',
                     approvalPolicy: 'never',
                     ...(command.model ? { model: command.model } : {}),
+                    ...isolation,
                 });
-                const forkThreadId = requireThreadId(fork, 'thread/fork');
+                const forkThreadId = requireThreadId(fork, method);
                 const turn = await send('turn/start', {
                     threadId: forkThreadId,
                     input: [{
@@ -582,8 +663,8 @@ export async function runCodexCommand(command) {
         })();
     });
 }
-async function callCodex(prompt, sessionId, model) {
-    const command = buildCodexSummarizerCommand({ sessionId, prompt, model });
+async function callCodex(prompt, sessionId, model, isolated = false) {
+    const command = buildCodexSummarizerCommand({ sessionId, prompt, model, isolated });
     return runCodexCommand(command);
 }
 function chunkExchanges(exchanges, chunkSize) {
@@ -597,7 +678,7 @@ function getCodexSessionId(exchanges, sessionId) {
     if (!exchanges.some(exchange => exchange.harness === 'codex')) {
         return undefined;
     }
-    return sessionId || exchanges.find(exchange => exchange.sessionId)?.sessionId;
+    return sessionId || exchanges.find(exchange => exchange.harness === 'codex' && exchange.sessionId)?.sessionId;
 }
 /**
  * Resolve the model to pass into Codex `thread/fork` for summarization.
@@ -609,8 +690,8 @@ function getCodexSessionId(exchanges, sessionId) {
  *
  * Default to `undefined` so `app-server` uses the current Codex config
  * (`~/.codex/config.toml#model`). Operators can override via
- * `EPISODIC_MEMORY_CODEX_MODEL` if they need a supported model id for their
- * selected Codex route.
+ * `EPISODIC_MEMORY_CODEX_MODEL` if they need a specific model id (e.g. an
+ * API-key user wanting `gpt-5.5-codex`).
  *
  * See https://github.com/obra/episodic-memory/issues/98.
  */
@@ -618,6 +699,10 @@ export function getCodexModel(_exchanges) {
     return process.env.EPISODIC_MEMORY_CODEX_MODEL || undefined;
 }
 export async function summarizeConversation(exchanges, sessionId) {
+    const recordPolicy = readRecordExclusions();
+    exchanges = exchanges.map(exchange => admitExchange(exchange, recordPolicy)).filter((exchange) => exchange !== null);
+    if (recordPolicy)
+        sessionId = undefined;
     // Handle trivial conversations
     if (exchanges.length === 0) {
         return 'Trivial conversation with no substantive content.';
@@ -628,19 +713,21 @@ export async function summarizeConversation(exchanges, sessionId) {
             return 'Trivial conversation with no substantive content.';
         }
     }
-    const isCodexConversation = exchanges.some(exchange => exchange.harness === 'codex');
-    if (isCodexConversation) {
-        const codexSessionId = getCodexSessionId(exchanges, sessionId);
-        if (!codexSessionId) {
-            throw new Error('Codex session ID is required for a read-only summary fork');
-        }
-        const result = await callCodex(buildCodexSummaryPrompt(), codexSessionId, getCodexModel(exchanges));
+    const codexSessionId = getCodexSessionId(exchanges, sessionId);
+    if (exchanges.some(exchange => exchange.harness === 'codex')) {
+        // A sessionless or policy-filtered transcript has no source context to fork.
+        // Summarize its admitted text in a fresh, isolated Codex thread instead.
+        const isolated = recordPolicy !== null || !codexSessionId;
+        const prompt = isolated
+            ? `${SUMMARIZER_CONTEXT_MARKER}. Summarize only the following admitted transcript in 2-4 factual sentences inside <summary></summary>. Do not inspect files, use tools or recover any original session.\n\n${formatConversationText(exchanges)}`
+            : buildCodexSummaryPrompt();
+        const result = await callCodex(prompt, isolated ? undefined : codexSessionId, getCodexModel(exchanges), isolated);
         return extractSummary(result);
     }
     // Cost safety (#104): everything below this point calls the metered Claude API
-    // path. Codex conversations return or fail before reaching this point.
-    // If a stray global ANTHROPIC_API_KEY would be billed and the user hasn't
+    // path. If a stray global ANTHROPIC_API_KEY would be billed and the user hasn't
     // acknowledged it, warn once and proceed (don't silently spend without notice).
+    // Placed AFTER the Codex attempt so pure-Codex users are never warned needlessly.
     if (wouldBillMeteredApi() && !meteredApiOptIn()) {
         warnMeteredApiOnce();
     }
@@ -651,7 +738,7 @@ export async function summarizeConversation(exchanges, sessionId) {
         // would fail on every one before the no-resume retry kicks in. Treat
         // missing harness as Claude for backward compatibility with old archives.
         const isClaudeSession = exchanges.some(e => e.harness === 'claude' || e.harness === undefined);
-        const claudeSessionId = isClaudeSession ? sessionId : undefined;
+        const claudeSessionId = !codexSessionId && isClaudeSession ? sessionId : undefined;
         const cwd = claudeSessionId ? exchanges.find(e => e.cwd)?.cwd : undefined;
         const conversationText = claudeSessionId
             ? '' // When resuming, no need to include conversation text - it's already in context

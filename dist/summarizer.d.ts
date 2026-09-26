@@ -57,10 +57,11 @@ export interface CodexSummarizerCommand {
     command: string;
     args: string[];
     prompt: string;
-    sessionId: string;
+    sessionId?: string;
     model?: string;
     versionArgs?: string[];
     skipVersionCheck?: boolean;
+    isolated?: boolean;
 }
 /**
  * Get API environment overrides for summarization calls.
@@ -150,10 +151,11 @@ export declare function buildSummarizerQueryOptions(args: {
 }): Record<string, unknown>;
 export declare function buildCodexSummaryPrompt(): string;
 export declare function buildCodexSummarizerCommand(args: {
-    sessionId: string;
+    sessionId?: string;
     prompt: string;
     model?: string;
     codexBin?: string;
+    isolated?: boolean;
 }): CodexSummarizerCommand;
 export declare function runCodexCommand(command: CodexSummarizerCommand): Promise<string>;
 /**

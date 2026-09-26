@@ -90,9 +90,6 @@ The test creates an isolated temporary `CODEX_HOME`, copies your existing Codex 
 
 ## Summaries
 
-Codex summaries use `codex app-server`, `thread/fork`, and `ephemeral: true`. This matters: `codex exec --ephemeral resume <session>` was tested and still appended to the resumed rollout, so it is not the quality bar for summarization.
+Codex summaries with a session ID use `codex app-server`, `thread/fork`, and `ephemeral: true`. This matters: `codex exec --ephemeral resume <session>` was tested and still appended to the resumed rollout, so it is not the quality bar for summarization. Without a session ID, an isolated ephemeral `thread/start` receives only the admitted transcript text and requires Codex `0.154.0` or newer.
 
-If the Codex app-server summarizer is unavailable, below the support floor, or
-the transcript has no session ID to fork, the summary attempt fails with a
-retryable error. It does not switch providers to Claude. Conversation exchanges
-can still be indexed and searched without a generated summary.
+If the Codex app-server summarizer is unavailable or below the applicable support floor, Episodic Memory records a retryable summary failure. It does not send Codex transcripts to Claude. Conversation exchanges can still be indexed and searched without a generated summary.

@@ -5,6 +5,7 @@ import { parseConversation } from './parser.js';
 import { getAllExchanges } from './db.js';
 import { getArchiveDir, getDbPath, getExcludedProjects, findJsonlFiles, statIfExists } from './paths.js';
 import { isErroredSentinel } from './summary-sentinel.js';
+import { readRecordExclusions } from './record-admission.js';
 
 export interface VerificationResult {
   missing: Array<{ path: string; reason: string }>;
@@ -12,16 +13,21 @@ export interface VerificationResult {
   orphaned: Array<{ uuid: string; path: string }>;
   outdated: Array<{ path: string; fileTime: number; dbTime: number }>;
   archiveRefreshes: Array<{ path: string; fileTime: number; dbTime: number }>;
+  screeningRejected: Array<{ path: string }>;
+  screeningUnavailable: Array<{ path: string }>;
   corrupted: Array<{ path: string; error: string }>;
 }
 
 export async function verifyIndex(): Promise<VerificationResult> {
+  readRecordExclusions();
   const result: VerificationResult = {
     missing: [],
     unindexed: [],
     orphaned: [],
     outdated: [],
     archiveRefreshes: [],
+    screeningRejected: [],
+    screeningUnavailable: [],
     corrupted: []
   };
 
@@ -100,10 +106,16 @@ export async function verifyIndex(): Promise<VerificationResult> {
           }
         }
       } catch (error) {
-        result.corrupted.push({
-          path: conversationPath,
-          error: error instanceof Error ? error.message : String(error)
-        });
+        const message = error instanceof Error ? error.message : String(error);
+        if (message === 'Record content rejected by screening' ||
+            message === 'Record screening byte limit exceeded' ||
+            message === 'Record screening nesting limit exceeded') {
+          result.screeningRejected.push({ path: conversationPath });
+        } else if (message === 'Record screening unavailable') {
+          result.screeningUnavailable.push({ path: conversationPath });
+        } else {
+          result.corrupted.push({ path: conversationPath, error: message });
+        }
       }
     }
   }
@@ -126,7 +138,11 @@ export async function verifyIndex(): Promise<VerificationResult> {
   return result;
 }
 
-export async function repairIndex(issues: Pick<VerificationResult, 'missing' | 'orphaned' | 'outdated' | 'corrupted'>): Promise<void> {
+export async function repairIndex(issues: VerificationResult): Promise<void> {
+  if (issues.screeningRejected.length + issues.screeningUnavailable.length > 0) {
+    throw new Error('Resolve record screening failures before repair');
+  }
+  readRecordExclusions();
   console.log('Repairing index...');
 
   // To avoid circular dependencies, we import the indexer functions dynamically
@@ -186,6 +202,8 @@ export async function repairIndex(issues: Pick<VerificationResult, 'missing' | '
       console.log(`  Indexed ${exchanges.length} exchanges`);
     } catch (error) {
       console.error(`Failed to re-index ${conversationPath}:`, error);
+      db.close();
+      throw error;
     }
   }
 

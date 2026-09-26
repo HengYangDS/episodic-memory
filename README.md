@@ -2,6 +2,21 @@
 
 Semantic search for Claude Code, Codex, Cursor, opencode, and Oh My Pi (OMP) conversations. Remember past discussions, decisions, and patterns.
 
+## Recall admission
+
+Search rechecks the current record-exclusion policy and configured credential scanner,
+including rows indexed before the policy changed. Excluded hits do not consume the
+requested result limit. A stale whole-conversation summary is omitted if any of its
+source records or tool calls is excluded; safe neighboring exchanges remain searchable.
+
+Conversation opt-out markers are read from decoded user text, including JSON escapes.
+Assistant quotations and tool outputs do not opt out the conversation. Tool-result
+blocks inside a user envelope are still tool output. Malformed legacy text retains
+conservative marker handling, and unreadable or oversized records fail closed.
+Ranged reads retain physical line coordinates without materializing unrelated message bodies.
+Original transcripts are never rewritten. Source and policy changes during a search
+abort the result rather than returning a partially validated view.
+
 ## Testimonial
 
 From an AI coding assistant's perspective:
@@ -214,7 +229,7 @@ In Codex and opencode, the skill guides the agent to use the episodic-memory MCP
 
 ## API Configuration
 
-By default, episodic-memory uses your Claude Code authentication for Claude Code summarization. Codex-indexed sessions with a session ID are summarized through `codex app-server` by creating an ephemeral `thread/fork`, so the summary can use Codex session context and reasoning summaries without appending to the original rollout.
+By default, episodic-memory uses your Claude Code authentication for Claude Code summarization. Codex-indexed sessions with a session ID are summarized through `codex app-server` by creating an ephemeral `thread/fork`, so the summary can use Codex session context and reasoning summaries without appending to the original rollout. A Codex transcript without a session ID is summarized from its admitted text in an isolated ephemeral `thread/start`; it is never sent to Claude.
 
 To route summarization through a custom Anthropic-compatible endpoint or override the model:
 
@@ -294,10 +309,7 @@ These pass through unchanged to episodic-memory's summarizer subprocess. Because
 
 These settings only affect episodic-memory's summarization calls, not your interactive Claude Code or Codex sessions.
 
-Codex summarization requires `codex-cli 0.130.0` or newer and a session ID for
-an ephemeral read-only fork. If that route is unavailable, the summary attempt
-fails and can be retried later; it does not silently switch to Claude or a
-metered Anthropic API. Indexing exchanges remains independent of the summary.
+Codex summarization requires `codex-cli 0.130.0` or newer; isolated transcript-only summaries require `0.154.0` or newer. If Codex app-server summarization is unavailable, sync records a retryable summary failure rather than switching providers. Indexing exchanges remains independent of the summary.
 
 ### What's Affected
 
@@ -439,14 +451,14 @@ open output.html
 
 ## Excluding Conversations
 
-Conversations containing this marker anywhere in their content will be archived but not indexed:
+Conversations with this marker in a decoded user instruction are excluded before new archive copying, parsing, and indexing:
 
 ```
 <INSTRUCTIONS-TO-EPISODIC-MEMORY>DO NOT INDEX THIS CHAT</INSTRUCTIONS-TO-EPISODIC-MEMORY>
 ```
 
 **Automatic exclusions:**
-- Conversations where Claude generates summaries (marker in system prompt)
+- Summarizer-generated conversations carrying the marker in their prompt
 - Meta-conversations about conversation processing
 
 **Use cases:**
@@ -455,7 +467,117 @@ Conversations containing this marker anywhere in their content will be archived 
 - Test or experimental sessions
 - Any conversation you don't want searchable
 
-The marker can appear in any message (user or assistant) and excludes the entire conversation from the search index.
+The marker in user instructions prevents new derived copies and indexing; an assistant quotation or tool result does not opt out the conversation. It does not delete an existing archive or index entry.
+
+### Persistent record exclusions
+
+`record-exclusions.json` in the existing configuration directory defines exact
+records that must not enter new derived archives, parser output, summaries, or
+database insertions. It is independent of `CONVERSATION_SEARCH_EXCLUDE_PROJECTS`;
+that environment variable cannot replace or disable record exclusions.
+
+```json
+{
+  "version": 1,
+  "exchanges": [
+    {
+      "session_id": "00000000-1111-4222-8333-444444444444",
+      "transcript": "rollout-00000000-1111-4222-8333-444444444444.jsonl",
+      "line_start": 4,
+      "line_end": 5
+    }
+  ],
+  "tool_calls": [
+    {
+      "session_id": "00000000-1111-4222-8333-444444444444",
+      "transcript": "rollout-00000000-1111-4222-8333-444444444444.jsonl",
+      "call_id": "call-example"
+    }
+  ]
+}
+```
+
+Line ranges are inclusive physical JSONL coordinates in the original transcript.
+Excluded records become empty lines in a derived copy, preserving later line
+numbers. Session identity, exact transcript basename and native tool-call identity, not
+a machine-specific absolute path, bind the policy. Sibling subagent transcripts
+sharing a parent session are separate subjects. Safe text blocks remain when only a tool block
+is excluded. Original transcripts are never changed.
+
+Malformed, unreadable, symlinked or oversized policy files reject admission.
+When a policy is present, unchanged source timestamps do not bypass a fresh
+admission decision. Source/archive aliasing and changing input are rejected.
+The marker scan and record stream use the same descriptor; source identity is
+checked during and after streaming. Direct database insertion checks both the
+transcript identity and historical session metadata, which may name an ancestor.
+The foreground sync CLI exits nonzero for per-file admission errors and does not
+claim successful synchronization or start embedding migration after those errors.
+Full, session and incremental indexing, repair, MCP reads and the display CLI use
+the same admission boundary. Display pagination retains physical line numbers.
+An absent policy retains ordinary behavior; deleting the policy intentionally
+removes its protection, so maintain it as private operator configuration.
+
+Summarization with a record policy uses admitted transcript text, never a resumed
+source session. Codex retains its selected provider through an ephemeral fresh
+context and fails rather than silently falling back to another provider. Claude
+receives the admitted text without session resume. Policy-enabled Codex summaries
+require Codex 0.154.0 or newer. The isolated summary path disables inherited
+tools, plugins, hooks, and skills, and refuses to proceed if the configured
+MCP or skill boundary cannot be established. It uses a temporary empty working
+directory; provider error payloads are suppressed and the directory is removed
+after process termination.
+
+### Optional local secret screening
+
+Add an optional `screening` object to the same policy to reject newly detected
+content before derived archive writes, reads, summaries and database insertion:
+
+```json
+"screening": {
+  "engine": "gitleaks",
+  "executable": "/absolute/resolved/path/to/gitleaks",
+  "sha256": "<64 lowercase hex characters from the trusted executable>",
+  "timeout_ms": 2000,
+  "max_record_bytes": 1048576
+}
+```
+
+Keep the existing `version`, `exchanges` and `tool_calls` fields. Install Gitleaks
+through a trusted package source, resolve its executable symlink and verify its provenance before pinning its
+SHA-256. On migration or upgrade, explicitly replace the host-local path and
+digest after verifying the new executable. The scanner must be a regular,
+executable file owned by the current user or root and not group/world-writable.
+Do not copy credential stores or an old host's executable-path assumption.
+
+Exact exclusions run first. Each remaining physical record is screened locally
+with the pinned Gitleaks built-in rules. Nested JSON strings are decoded while
+retaining key/value assignment context; separate exchange messages are screened
+separately. A finding rejects the operation rather than silently dropping a new
+message and breaking conversation pairing. Missing/changed executables, byte or
+nesting limits, timeouts and malformed or contradictory reports fail closed.
+Verification reports scanner rejections and scanner unavailability separately
+from transcript corruption, even when a summary is missing. A broad repair
+refuses to start while either screening failure remains.
+No findings, input, scanner diagnostics or secret fingerprints appear in errors.
+The scanner receives stdin in a private empty working directory with no inherited
+environment/configuration and with inline allow comments disabled. Its temporary
+directory is removed after execution. Original transcripts and previously
+published archives remain unchanged when admission fails.
+
+Screening launches a bounded subprocess per record; it is not an unbounded bulk
+collection service. Measure a finite representative batch before large imports.
+No automatic sync or background job is enabled by this setting. Before enabling
+it, replace all policy consumers with this version through their native lifecycle:
+older strict-schema consumers reject the additional field. Installing a plugin
+does not replace already-loaded code, so do not enable the field while protected
+old consumers still require the previous schema.
+
+Without `screening`, this policy remains an exact exclusion mechanism. Even with
+screening, pattern matching does not prove universal unknown-secret absence,
+purge preexisting derived data, rewrite original
+sessions, or retroactively filter already-loaded code. Old randomly generated
+tool-row IDs need verified native source-call mapping before policy migration;
+do not broaden those entries to whole sessions or claim a complete migration.
 
 ## MCP Server
 

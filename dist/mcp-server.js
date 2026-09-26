@@ -2044,7 +2044,7 @@ var require_fast_deep_equal = __commonJS({
       if (a === b2) return true;
       if (a && b2 && typeof a == "object" && typeof b2 == "object") {
         if (a.constructor !== b2.constructor) return false;
-        var length, i, keys;
+        var length, i, keys2;
         if (Array.isArray(a)) {
           length = a.length;
           if (length != b2.length) return false;
@@ -2055,13 +2055,13 @@ var require_fast_deep_equal = __commonJS({
         if (a.constructor === RegExp) return a.source === b2.source && a.flags === b2.flags;
         if (a.valueOf !== Object.prototype.valueOf) return a.valueOf() === b2.valueOf();
         if (a.toString !== Object.prototype.toString) return a.toString() === b2.toString();
-        keys = Object.keys(a);
-        length = keys.length;
+        keys2 = Object.keys(a);
+        length = keys2.length;
         if (length !== Object.keys(b2).length) return false;
         for (i = length; i-- !== 0; )
-          if (!Object.prototype.hasOwnProperty.call(b2, keys[i])) return false;
+          if (!Object.prototype.hasOwnProperty.call(b2, keys2[i])) return false;
         for (i = length; i-- !== 0; ) {
-          var key = keys[i];
+          var key = keys2[i];
           if (!equal(a[key], b2[key])) return false;
         }
         return true;
@@ -3258,8 +3258,8 @@ var require_utils = __commonJS({
       }
       return ind;
     }
-    function removeDotSegments(path3) {
-      let input2 = path3;
+    function removeDotSegments(path4) {
+      let input2 = path4;
       const output2 = [];
       let nextSlash = -1;
       let len = 0;
@@ -3668,8 +3668,8 @@ var require_schemes = __commonJS({
       }
       if (wsComponent.resourceName) {
         const queryIndex = wsComponent.resourceName.indexOf("?");
-        const path3 = queryIndex === -1 ? wsComponent.resourceName : wsComponent.resourceName.slice(0, queryIndex);
-        wsComponent.path = path3 && path3 !== "/" ? path3 : void 0;
+        const path4 = queryIndex === -1 ? wsComponent.resourceName : wsComponent.resourceName.slice(0, queryIndex);
+        wsComponent.path = path4 && path4 !== "/" ? path4 : void 0;
         wsComponent.query = queryIndex === -1 ? void 0 : wsComponent.resourceName.slice(queryIndex + 1);
         wsComponent.resourceName = void 0;
       }
@@ -12788,12 +12788,12 @@ var require_dist = __commonJS({
         throw new Error(`Unknown format "${name}"`);
       return f;
     };
-    function addFormats(ajv, list, fs5, exportName) {
+    function addFormats(ajv, list, fs6, exportName) {
       var _a3;
       var _b;
       (_a3 = (_b = ajv.opts.code).formats) !== null && _a3 !== void 0 ? _a3 : _b.formats = (0, codegen_1._)`require("ajv-formats/dist/formats").${exportName}`;
       for (const f of list)
-        ajv.addFormat(f, fs5[f]);
+        ajv.addFormat(f, fs6[f]);
     }
     module.exports = exports = formatsPlugin;
     Object.defineProperty(exports, "__esModule", { value: true });
@@ -13244,9 +13244,9 @@ function floatSafeRemainder(val, step) {
   return ratio - roundedRatio;
 }
 var EVALUATING = /* @__PURE__ */ Symbol("evaluating");
-function defineLazy(object3, key, getter) {
+function defineLazy(object4, key, getter) {
   let value = void 0;
-  Object.defineProperty(object3, key, {
+  Object.defineProperty(object4, key, {
     get() {
       if (value === EVALUATING) {
         return void 0;
@@ -13258,7 +13258,7 @@ function defineLazy(object3, key, getter) {
       return value;
     },
     set(v2) {
-      Object.defineProperty(object3, key, {
+      Object.defineProperty(object4, key, {
         value: v2
         // configurable: true,
       });
@@ -13288,18 +13288,18 @@ function mergeDefs(...defs) {
 function cloneDef(schema) {
   return mergeDefs(schema._zod.def);
 }
-function getElementAtPath(obj, path3) {
-  if (!path3)
+function getElementAtPath(obj, path4) {
+  if (!path4)
     return obj;
-  return path3.reduce((acc, key) => acc?.[key], obj);
+  return path4.reduce((acc, key) => acc?.[key], obj);
 }
 function promiseAllObject(promisesObj) {
-  const keys = Object.keys(promisesObj);
-  const promises = keys.map((key) => promisesObj[key]);
+  const keys2 = Object.keys(promisesObj);
+  const promises = keys2.map((key) => promisesObj[key]);
   return Promise.all(promises).then((results) => {
     const resolvedObj = {};
-    for (let i = 0; i < keys.length; i++) {
-      resolvedObj[keys[i]] = results[i];
+    for (let i = 0; i < keys2.length; i++) {
+      resolvedObj[keys2[i]] = results[i];
     }
     return resolvedObj;
   });
@@ -13703,11 +13703,11 @@ function explicitlyAborted(x2, startIndex = 0) {
   }
   return false;
 }
-function prefixIssues(path3, issues) {
+function prefixIssues(path4, issues) {
   return issues.map((iss) => {
     var _a3;
     (_a3 = iss).path ?? (_a3.path = []);
-    iss.path.unshift(path3);
+    iss.path.unshift(path4);
     return iss;
   });
 }
@@ -14140,16 +14140,16 @@ function flattenError(error61, mapper = (issue2) => issue2.message) {
 }
 function formatError(error61, mapper = (issue2) => issue2.message) {
   const fieldErrors = { _errors: [] };
-  const processError = (error62, path3 = []) => {
+  const processError = (error62, path4 = []) => {
     for (const issue2 of error62.issues) {
       if (issue2.code === "invalid_union" && issue2.errors.length) {
-        issue2.errors.map((issues) => processError({ issues }, [...path3, ...issue2.path]));
+        issue2.errors.map((issues) => processError({ issues }, [...path4, ...issue2.path]));
       } else if (issue2.code === "invalid_key") {
-        processError({ issues: issue2.issues }, [...path3, ...issue2.path]);
+        processError({ issues: issue2.issues }, [...path4, ...issue2.path]);
       } else if (issue2.code === "invalid_element") {
-        processError({ issues: issue2.issues }, [...path3, ...issue2.path]);
+        processError({ issues: issue2.issues }, [...path4, ...issue2.path]);
       } else {
-        const fullpath = [...path3, ...issue2.path];
+        const fullpath = [...path4, ...issue2.path];
         if (fullpath.length === 0) {
           fieldErrors._errors.push(mapper(issue2));
         } else {
@@ -14188,17 +14188,17 @@ function formatError(error61, mapper = (issue2) => issue2.message) {
 }
 function treeifyError(error61, mapper = (issue2) => issue2.message) {
   const result = { errors: [] };
-  const processError = (error62, path3 = []) => {
+  const processError = (error62, path4 = []) => {
     var _a3;
     for (const issue2 of error62.issues) {
       if (issue2.code === "invalid_union" && issue2.errors.length) {
-        issue2.errors.map((issues) => processError({ issues }, [...path3, ...issue2.path]));
+        issue2.errors.map((issues) => processError({ issues }, [...path4, ...issue2.path]));
       } else if (issue2.code === "invalid_key") {
-        processError({ issues: issue2.issues }, [...path3, ...issue2.path]);
+        processError({ issues: issue2.issues }, [...path4, ...issue2.path]);
       } else if (issue2.code === "invalid_element") {
-        processError({ issues: issue2.issues }, [...path3, ...issue2.path]);
+        processError({ issues: issue2.issues }, [...path4, ...issue2.path]);
       } else {
-        const fullpath = [...path3, ...issue2.path];
+        const fullpath = [...path4, ...issue2.path];
         if (fullpath.length === 0) {
           result.errors.push(mapper(issue2));
           continue;
@@ -14237,8 +14237,8 @@ function treeifyError(error61, mapper = (issue2) => issue2.message) {
 }
 function toDotPath(_path) {
   const segs = [];
-  const path3 = _path.map((seg) => typeof seg === "object" ? seg.key : seg);
-  for (const seg of path3) {
+  const path4 = _path.map((seg) => typeof seg === "object" ? seg.key : seg);
+  for (const seg of path4) {
     if (typeof seg === "number")
       segs.push(`[${seg}]`);
     else if (typeof seg === "symbol")
@@ -15937,10 +15937,10 @@ function handlePropertyResult(result, final, key, input2, optin, optout) {
 }
 var NO_SYMBOL_KEYS = [];
 function normalizeDef(def) {
-  const keys = Object.keys(def.shape);
+  const keys2 = Object.keys(def.shape);
   const ownSymbols = Object.getOwnPropertySymbols(def.shape);
   const symbolKeys = ownSymbols.length ? ownSymbols : NO_SYMBOL_KEYS;
-  const allKeys = symbolKeys.length ? [...keys, ...symbolKeys] : keys;
+  const allKeys = symbolKeys.length ? [...keys2, ...symbolKeys] : keys2;
   for (const k2 of allKeys) {
     if (!def.shape?.[k2]?._zod?.traits?.has("$ZodType")) {
       throw new Error(`Invalid element at key "${String(k2)}": expected a Zod schema`);
@@ -15952,8 +15952,8 @@ function normalizeDef(def) {
     allKeys,
     symbolKeys,
     // string-only: handleCatchall matches it against `for...in`, which never yields a symbol
-    keySet: new Set(keys),
-    numKeys: keys.length,
+    keySet: new Set(keys2),
+    numKeys: keys2.length,
     optionalKeys: new Set(okeys)
   };
 }
@@ -16471,19 +16471,19 @@ function handleIntersectionResults(result, left, right) {
   let unrecIssue;
   const keyIssues = /* @__PURE__ */ new Map();
   const collect = (iss, side) => {
-    let keys;
+    let keys2;
     if (iss.code === "unrecognized_keys" && !iss.path?.length) {
       unrecIssue ?? (unrecIssue = iss);
-      keys = iss.keys;
+      keys2 = iss.keys;
     } else if (iss.code === "invalid_key" && iss.origin === "record" && iss.path?.length === 1) {
       const k2 = String(iss.path[0]);
       if (!keyIssues.has(k2))
         keyIssues.set(k2, iss);
-      keys = [k2];
+      keys2 = [k2];
     } else {
       return false;
     }
-    for (const k2 of keys) {
+    for (const k2 of keys2) {
       if (!unrecKeys.has(k2))
         unrecKeys.set(k2, {});
       unrecKeys.get(k2)[side] = true;
@@ -25767,13 +25767,13 @@ function generateObjectCheck(doc, ctx, schema, accessor, buildsValue = true) {
   const def = schema._zod.def;
   doc.write(`if (typeof ${accessor} !== "object" || ${accessor} === null || Array.isArray(${accessor})) return INVALID;`);
   const shape = def.shape;
-  const keys = Object.keys(shape);
+  const keys2 = Object.keys(shape);
   const symbolKeys = Object.getOwnPropertySymbols(shape);
-  const allKeys = symbolKeys.length ? [...keys, ...symbolKeys] : keys;
+  const allKeys = symbolKeys.length ? [...keys2, ...symbolKeys] : keys2;
   const keyExpr = (k2) => typeof k2 === "symbol" ? addConstant(ctx, k2) : esc(k2);
   const propKey = (k2) => typeof k2 === "symbol" ? `[${keyExpr(k2)}]` : esc(k2);
   const propShape = shape;
-  if (keys.includes("__proto__")) {
+  if (keys2.includes("__proto__")) {
     throw new ZodCompileUnsupportedError('object shape key "__proto__"');
   }
   const propOutputs = /* @__PURE__ */ new Map();
@@ -25815,7 +25815,7 @@ function generateObjectCheck(doc, ctx, schema, accessor, buildsValue = true) {
   if (catchall) {
     const catchallType = catchall._zod.def.type;
     if (catchallType === "never") {
-      const condition = keys.map((k2) => `k !== ${esc(k2)}`).join(" && ") || "true";
+      const condition = keys2.map((k2) => `k !== ${esc(k2)}`).join(" && ") || "true";
       doc.write(`for (const k in ${accessor}) {`);
       doc.indented((d2) => {
         d2.write(`if (${condition}) return INVALID;`);
@@ -25831,7 +25831,7 @@ function generateObjectCheck(doc, ctx, schema, accessor, buildsValue = true) {
   const hasConditionalKeys = allKeys.some((k2) => mayOutputUndefined(propShape[k2]) || dropsWhenAbsent(propShape[k2]));
   if (!buildsValue) {
     if (unknownKeysMode === "schema") {
-      const knownSet = keys.length > 0 ? addConstant(ctx, new Set(keys)) : null;
+      const knownSet = keys2.length > 0 ? addConstant(ctx, new Set(keys2)) : null;
       doc.write(`for (const k in ${accessor}) {`);
       doc.indented((d2) => {
         d2.write(`if (k === "__proto__") continue;`);
@@ -25863,7 +25863,7 @@ function generateObjectCheck(doc, ctx, schema, accessor, buildsValue = true) {
     }
   }
   if (unknownKeysMode !== "none") {
-    const knownSet = keys.length > 0 ? addConstant(ctx, new Set(keys)) : null;
+    const knownSet = keys2.length > 0 ? addConstant(ctx, new Set(keys2)) : null;
     doc.write(`for (const k in ${accessor}) {`);
     doc.indented((d2) => {
       d2.write(`if (k === "__proto__") continue;`);
@@ -27851,8 +27851,8 @@ function compactTypeUnion(schema) {
     if (!option || typeof option !== "object")
       return;
     compactTypeUnion(option);
-    const keys = Object.keys(option);
-    if (keys.length !== 1 || keys[0] !== "type")
+    const keys2 = Object.keys(option);
+    if (keys2.length !== 1 || keys2[0] !== "type")
       return;
     const type = option.type;
     for (const member of Array.isArray(type) ? type : [type]) {
@@ -27886,8 +27886,8 @@ function foldObjects(members2) {
   }
   const properties = {};
   const required2 = /* @__PURE__ */ new Set();
-  for (const object3 of objects) {
-    for (const key in object3.properties) {
+  for (const object4 of objects) {
+    for (const key in object4.properties) {
       if (Object.prototype.hasOwnProperty.call(properties, key))
         continue;
       const parts = [];
@@ -27901,18 +27901,18 @@ function foldObjects(members2) {
       const merged = parts.length === 1 ? parts[0] : foldObjects(parts) ?? { allOf: parts };
       assignProp(properties, key, merged);
     }
-    for (const key of object3.required ?? [])
+    for (const key of object4.required ?? [])
       required2.add(key);
   }
   const folded = { type: "object", properties };
   if (required2.size)
     folded.required = [...required2];
-  if (objects.every((object3) => object3.additionalProperties === false)) {
+  if (objects.every((object4) => object4.additionalProperties === false)) {
     folded.additionalProperties = false;
   } else {
     const constraints = [];
-    for (const object3 of objects) {
-      const constraint = undeclaredConstraint(object3);
+    for (const object4 of objects) {
+      const constraint = undeclaredConstraint(object4);
       if (constraint && !constraints.some((seen) => JSON.stringify(seen) === JSON.stringify(constraint)))
         constraints.push(constraint);
     }
@@ -28944,10 +28944,10 @@ function visit(schema, fnOrHandlers) {
     switch (kind) {
       case "object": {
         const oldShape = def.shape;
-        const keys = Object.keys(oldShape);
+        const keys2 = Object.keys(oldShape);
         let changed = false;
         const newShape = {};
-        for (const k2 of keys) {
+        for (const k2 of keys2) {
           const mapped = run(oldShape[k2]);
           if (mapped !== oldShape[k2])
             changed = true;
@@ -30669,11 +30669,11 @@ var ZodEnum = /* @__PURE__ */ $constructor("ZodEnum", (inst, def) => {
   inst._zod.processJSONSchema = (ctx, json2, params) => enumProcessor(inst, ctx, json2, params);
   inst.enum = def.entries;
   inst.options = Object.values(def.entries);
-  const keys = new Set(Object.keys(def.entries));
+  const keys2 = new Set(Object.keys(def.entries));
   inst.extract = (values, params) => {
     const newEntries = {};
     for (const value of values) {
-      if (keys.has(value)) {
+      if (keys2.has(value)) {
         newEntries[value] = def.entries[value];
       } else
         throw new Error(`Key ${value} not found in enum`);
@@ -30688,7 +30688,7 @@ var ZodEnum = /* @__PURE__ */ $constructor("ZodEnum", (inst, def) => {
   inst.exclude = (values, params) => {
     const newEntries = { ...def.entries };
     for (const value of values) {
-      if (keys.has(value)) {
+      if (keys2.has(value)) {
         delete newEntries[value];
       } else
         throw new Error(`Key ${value} not found in enum`);
@@ -31223,13 +31223,13 @@ function resolveRef(ref, ctx) {
   if (!ref.startsWith("#")) {
     throw new Error("External $ref is not supported, only local refs (#/...) are allowed");
   }
-  const path3 = ref.slice(1).split("/").filter(Boolean);
-  if (path3.length === 0) {
+  const path4 = ref.slice(1).split("/").filter(Boolean);
+  if (path4.length === 0) {
     return ctx.rootSchema;
   }
   const defsKey = ctx.version === "draft-2020-12" ? "$defs" : "definitions";
-  if (path3[0] === defsKey) {
-    const key = path3[1] === void 0 ? void 0 : decodeJSONPointerSegment(path3[1]);
+  if (path4[0] === defsKey) {
+    const key = path4[1] === void 0 ? void 0 : decodeJSONPointerSegment(path4[1]);
     if (!key || !ctx.defs[key]) {
       throw new Error(`Reference not found: ${ref}`);
     }
@@ -35031,9 +35031,16 @@ var StdioServerTransport = class {
 
 // src/db.ts
 import Database from "better-sqlite3";
-import path2 from "path";
-import fs2 from "fs";
-import * as sqliteVec from "sqlite-vec";
+
+// src/record-admission.ts
+import fs2 from "node:fs";
+import path2 from "node:path";
+import crypto from "node:crypto";
+import os2 from "node:os";
+import { spawnSync } from "node:child_process";
+
+// src/constants.ts
+var SUMMARIZER_CONTEXT_MARKER = "Context: This summary will be shown in a list to help users and Claude choose which conversations are relevant";
 
 // src/paths.ts
 import os from "os";
@@ -35080,6 +35087,430 @@ function getDbPath() {
   }
   return path.join(getIndexDir(), "db.sqlite");
 }
+
+// src/record-admission.ts
+var EXCLUSION_MARKERS = [
+  "<INSTRUCTIONS-TO-EPISODIC-MEMORY>DO NOT INDEX THIS CHAT</INSTRUCTIONS-TO-EPISODIC-MEMORY>",
+  "Only use NO_INSIGHTS_FOUND",
+  SUMMARIZER_CONTEXT_MARKER
+];
+var MARKER_SCAN_CHUNK_BYTES = 1 << 20;
+function instructionText(record2) {
+  if (!object3(record2)) return "";
+  if (record2.type === "event_msg" && object3(record2.payload)) {
+    return record2.payload.type === "user_message" && typeof record2.payload.message === "string" ? record2.payload.message : "";
+  }
+  const message = record2.type === "response_item" ? record2.payload : record2.message;
+  if (!object3(message) || (message.role ?? record2.role) !== "user") return "";
+  const content = record2.type === "opencode_message" ? record2.parts : message.content;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.filter((part) => object3(part) && ["text", "input_text"].includes(String(part.type)) && typeof part.text === "string").map((part) => part.text).join("\n");
+}
+function descriptorHasExclusionMarker(fd, byteLimit = Infinity, digest) {
+  if (!fs2.fstatSync(fd).isFile()) throw new Error("Conversation input must be a regular file");
+  const buffer = Buffer.allocUnsafe(MARKER_SCAN_CHUNK_BYTES);
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let pending = Buffer.alloc(0);
+  let position = 0;
+  const excluded = (bytes) => {
+    const line = decoder.decode(bytes);
+    let text;
+    try {
+      text = instructionText(JSON.parse(line));
+    } catch {
+      text = line;
+    }
+    return EXCLUSION_MARKERS.some((marker) => text.includes(marker));
+  };
+  let count;
+  while (position < byteLimit && (count = fs2.readSync(fd, buffer, 0, Math.min(buffer.length, byteLimit - position), position)) > 0) {
+    position += count;
+    digest?.update(buffer.subarray(0, count));
+    pending = Buffer.concat([pending, buffer.subarray(0, count)]);
+    let newline;
+    while ((newline = pending.indexOf(10)) !== -1) {
+      if (newline > 64 * 1024 * 1024) throw new Error("Conversation record exceeds admission byte limit");
+      if (excluded(pending.subarray(0, newline))) return true;
+      pending = pending.subarray(newline + 1);
+    }
+    if (pending.length > 64 * 1024 * 1024) throw new Error("Conversation record exceeds admission byte limit");
+  }
+  if (position < byteLimit && byteLimit !== Infinity) throw new Error("Conversation changed during record admission");
+  return pending.length > 0 && excluded(pending);
+}
+function assertUnchangedInput(file2, initial) {
+  const current = fs2.lstatSync(file2);
+  if (!current.isFile() || initial.dev !== current.dev || initial.ino !== current.ino || initial.size !== current.size || initial.mtimeMs !== current.mtimeMs || initial.ctimeMs !== current.ctimeMs) {
+    throw new Error("Conversation changed during record admission");
+  }
+}
+function assertUnchangedSearchPrefix(file2, initial, expectedDigest) {
+  const changed = () => new Error("Conversation changed during record admission");
+  let current;
+  try {
+    current = fs2.lstatSync(file2);
+  } catch {
+    throw changed();
+  }
+  if (!current.isFile() || initial.dev !== current.dev || initial.ino !== current.ino || current.size < initial.size) {
+    throw changed();
+  }
+  if (current.size === initial.size && current.mtimeMs === initial.mtimeMs && current.ctimeMs === initial.ctimeMs) return;
+  let fd;
+  try {
+    fd = fs2.openSync(file2, fs2.constants.O_RDONLY | fs2.constants.O_NOFOLLOW);
+    const opened = fs2.fstatSync(fd);
+    if (!opened.isFile() || opened.dev !== initial.dev || opened.ino !== initial.ino || opened.size < initial.size) throw changed();
+    const digest = crypto.createHash("sha256");
+    const buffer = Buffer.allocUnsafe(MARKER_SCAN_CHUNK_BYTES);
+    let position = 0;
+    while (position < initial.size) {
+      const count = fs2.readSync(fd, buffer, 0, Math.min(buffer.length, initial.size - position), position);
+      if (count <= 0) throw changed();
+      digest.update(buffer.subarray(0, count));
+      position += count;
+    }
+    if (digest.digest("hex") !== expectedDigest) throw changed();
+    current = fs2.lstatSync(file2);
+    if (!current.isFile() || current.dev !== initial.dev || current.ino !== initial.ino || current.size < initial.size) throw changed();
+  } catch {
+    throw changed();
+  } finally {
+    if (fd !== void 0) fs2.closeSync(fd);
+  }
+}
+function assertUnchangedPolicy(expected) {
+  if (JSON.stringify(readRecordExclusions()) !== expected) {
+    throw new Error("Record exclusion policy changed during record admission");
+  }
+}
+var POLICY_ERROR = "Invalid or unreadable record exclusion policy";
+var UUID = /[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}/ig;
+function object3(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function keys(value, expected) {
+  return Object.keys(value).length === expected.length && expected.every((key) => key in value);
+}
+function transcriptName(value) {
+  return identity(value) && !/[\\/]/.test(value) && value.endsWith(".jsonl") && value !== ".jsonl";
+}
+function identity(value) {
+  return typeof value === "string" && value.length > 0 && value.length <= 512 && !/[\x00-\x1f]/.test(value);
+}
+function screeningText(value, depth = 0) {
+  if (depth > 24) throw new Error("Record screening nesting limit exceeded");
+  if (typeof value === "string") {
+    let decoded;
+    try {
+      decoded = JSON.parse(value);
+    } catch {
+      return value;
+    }
+    if (typeof decoded === "string" || object3(decoded) || Array.isArray(decoded)) {
+      return screeningText(decoded, depth + 1);
+    }
+    return value;
+  }
+  if (Array.isArray(value)) return value.map((item) => screeningText(item, depth + 1)).join("\n");
+  if (object3(value)) {
+    return Object.entries(value).map(([key, item]) => `${key} = ${screeningText(item, depth + 1)}`).join("\n");
+  }
+  return value == null ? "" : String(value);
+}
+function createRecordScreener(policy) {
+  const config2 = policy?.screening;
+  if (!config2) return { scan() {
+  }, close() {
+  } };
+  const unavailable = () => new Error("Record screening unavailable");
+  let initial;
+  let fd;
+  try {
+    if (fs2.realpathSync(config2.executable) !== config2.executable) throw unavailable();
+    fd = fs2.openSync(config2.executable, fs2.constants.O_RDONLY | fs2.constants.O_NOFOLLOW);
+    initial = fs2.fstatSync(fd);
+    if (!initial.isFile() || initial.size < 1 || initial.size > 134217728 || (initial.mode & 18) !== 0 || typeof process.getuid === "function" && initial.uid !== 0 && initial.uid !== process.getuid()) {
+      throw unavailable();
+    }
+    fs2.accessSync(config2.executable, fs2.constants.X_OK);
+    const digest = crypto.createHash("sha256").update(fs2.readFileSync(fd)).digest("hex");
+    if (digest !== config2.sha256) throw unavailable();
+  } catch {
+    throw unavailable();
+  } finally {
+    if (fd !== void 0) fs2.closeSync(fd);
+  }
+  let directory;
+  try {
+    directory = fs2.mkdtempSync(path2.join(os2.tmpdir(), "episodic-screen-"));
+    fs2.chmodSync(directory, 448);
+  } catch {
+    throw unavailable();
+  }
+  const unchanged = () => {
+    try {
+      const current = fs2.lstatSync(config2.executable);
+      if (!current.isFile() || current.dev !== initial.dev || current.ino !== initial.ino || current.size !== initial.size || current.mtimeMs !== initial.mtimeMs || current.ctimeMs !== initial.ctimeMs) throw unavailable();
+    } catch {
+      throw unavailable();
+    }
+  };
+  return {
+    scan(value) {
+      const raw = typeof value === "string" ? value : JSON.stringify(value);
+      if (raw === void 0) return;
+      if (Buffer.byteLength(raw) > config2.max_record_bytes) throw new Error("Record screening byte limit exceeded");
+      const input2 = screeningText(value);
+      if (Buffer.byteLength(input2) > config2.max_record_bytes) throw new Error("Record screening byte limit exceeded");
+      if (!input2.trim()) return;
+      unchanged();
+      const result = spawnSync(config2.executable, [
+        "stdin",
+        "--redact",
+        "--no-banner",
+        "--log-level",
+        "error",
+        "--ignore-gitleaks-allow",
+        "--exit-code",
+        "10",
+        "--report-format",
+        "json",
+        "--report-path",
+        "-"
+      ], {
+        input: input2,
+        encoding: "utf8",
+        cwd: directory,
+        shell: false,
+        env: { HOME: directory, USERPROFILE: directory, PATH: path2.dirname(config2.executable) },
+        timeout: config2.timeout_ms,
+        killSignal: "SIGKILL",
+        maxBuffer: 1048576,
+        windowsHide: true
+      });
+      unchanged();
+      if (result.error || result.signal || ![0, 10].includes(result.status ?? -1)) throw unavailable();
+      let report;
+      try {
+        report = JSON.parse(result.stdout);
+      } catch {
+        throw unavailable();
+      }
+      if (!Array.isArray(report) || result.status === 0 && report.length !== 0 || result.status === 10 && (report.length === 0 || !report.every((item) => object3(item) && typeof item.RuleID === "string"))) {
+        throw unavailable();
+      }
+      if (result.status === 10) throw new Error("Record content rejected by screening");
+    },
+    close() {
+      fs2.rmSync(directory, { recursive: true, force: true });
+    }
+  };
+}
+function readRecordExclusions() {
+  const file2 = path2.join(getSuperpowersDir(), "record-exclusions.json");
+  let fd;
+  try {
+    fd = fs2.openSync(file2, fs2.constants.O_RDONLY | fs2.constants.O_NOFOLLOW);
+    const info = fs2.fstatSync(fd);
+    if (!info.isFile() || info.size > 4 * 1024 * 1024) throw new Error(POLICY_ERROR);
+    const value = JSON.parse(fs2.readFileSync(fd, "utf8"));
+    if (!object3(value) || !keys(value, "screening" in value ? ["version", "exchanges", "tool_calls", "screening"] : ["version", "exchanges", "tool_calls"]) || value.version !== 1 || !Array.isArray(value.exchanges) || !Array.isArray(value.tool_calls)) throw new Error(POLICY_ERROR);
+    if ("screening" in value) {
+      const s = value.screening;
+      if (!object3(s) || !keys(s, ["engine", "executable", "sha256", "timeout_ms", "max_record_bytes"]) || s.engine !== "gitleaks" || typeof s.executable !== "string" || !path2.isAbsolute(s.executable) || /[\x00-\x1f]/.test(s.executable) || typeof s.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(s.sha256) || !Number.isSafeInteger(s.timeout_ms) || Number(s.timeout_ms) < 50 || Number(s.timeout_ms) > 3e4 || !Number.isSafeInteger(s.max_record_bytes) || Number(s.max_record_bytes) < 1 || Number(s.max_record_bytes) > 8388608) {
+        throw new Error(POLICY_ERROR);
+      }
+    }
+    for (const row of value.exchanges) {
+      if (!object3(row) || !keys(row, ["session_id", "transcript", "line_start", "line_end"]) || !identity(row.session_id) || !transcriptName(row.transcript) || !Number.isSafeInteger(row.line_start) || !Number.isSafeInteger(row.line_end) || row.line_start < 1 || row.line_end < row.line_start) throw new Error(POLICY_ERROR);
+    }
+    for (const row of value.tool_calls) {
+      if (!object3(row) || !keys(row, ["session_id", "transcript", "call_id"]) || !identity(row.session_id) || !transcriptName(row.transcript) || !identity(row.call_id)) throw new Error(POLICY_ERROR);
+    }
+    return value;
+  } catch (error61) {
+    if (fd === void 0 && error61.code === "ENOENT") return null;
+    throw new Error(POLICY_ERROR);
+  } finally {
+    if (fd !== void 0) fs2.closeSync(fd);
+  }
+}
+function excludedSession(policy, sessionId) {
+  return !!sessionId && !!policy && (policy.exchanges.some((x2) => x2.session_id === sessionId) || policy.tool_calls.some((x2) => x2.session_id === sessionId));
+}
+function sessionFromPath(file2) {
+  return path2.basename(file2).match(UUID)?.at(-1);
+}
+function sessionFromRecord(value) {
+  if (value?.type === "session_meta") return value.payload?.id;
+  if (value?.type === "session") return value.id;
+  if (value?.type === "opencode_session") return value.session?.id;
+  return value?.sessionId ?? value?.sessionID ?? value?.message?.sessionID;
+}
+function blockedCall(policy, sessionId, transcript, callId) {
+  return typeof callId === "string" && policy.tool_calls.some((x2) => x2.session_id === sessionId && x2.transcript === transcript && x2.call_id === callId);
+}
+function filterRecord(line, number4, policy, transcript, sessionId) {
+  if (!policy || !sessionId) return line;
+  if (policy.exchanges.some((x2) => x2.session_id === sessionId && x2.transcript === transcript && number4 >= x2.line_start && number4 <= x2.line_end)) return "";
+  let value;
+  try {
+    value = JSON.parse(line);
+  } catch {
+    return line;
+  }
+  if (blockedCall(policy, sessionId, transcript, value?.payload?.call_id) || blockedCall(policy, sessionId, transcript, value?.call_id)) return "";
+  const content = value?.message?.content;
+  if (Array.isArray(content)) {
+    const kept = content.filter((block) => !blockedCall(policy, sessionId, transcript, block?.id ?? block?.tool_use_id));
+    if (kept.length !== content.length) {
+      return JSON.stringify({ ...value, message: { ...value.message, content: kept } });
+    }
+  }
+  if (Array.isArray(value?.parts)) {
+    const kept = value.parts.filter((part) => !blockedCall(policy, sessionId, transcript, part?.callID ?? part?.id));
+    if (kept.length !== value.parts.length) return JSON.stringify({ ...value, parts: kept });
+  }
+  return line;
+}
+async function* admittedRecords(file2, policy, startLine = 1, endLine = Infinity) {
+  const policySnapshot = JSON.stringify(policy);
+  assertUnchangedPolicy(policySnapshot);
+  const input2 = fs2.openSync(file2, fs2.constants.O_RDONLY | fs2.constants.O_NOFOLLOW);
+  const initial = fs2.fstatSync(input2);
+  let stream;
+  let screener;
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let pending = Buffer.alloc(0);
+  let sessionId = sessionFromPath(file2);
+  let primaryIdentitySeen = false;
+  let number4 = 0;
+  const admit = (bytes, terminated) => {
+    number4++;
+    const crlf = terminated && bytes.at(-1) === 13;
+    const line = decoder.decode(crlf ? bytes.subarray(0, -1) : bytes);
+    let recordSession;
+    try {
+      recordSession = sessionFromRecord(JSON.parse(line));
+    } catch {
+    }
+    if (recordSession && !primaryIdentitySeen) {
+      if (sessionId && recordSession !== sessionId && (excludedSession(policy, sessionId) || excludedSession(policy, recordSession))) {
+        throw new Error("Record exclusion session identity mismatch");
+      }
+      sessionId = recordSession;
+      primaryIdentitySeen = true;
+    }
+    const filtered = number4 >= startLine && number4 <= endLine ? filterRecord(line, number4, policy, path2.basename(file2), sessionId) : "";
+    screener?.scan(filtered);
+    return { line: filtered, ending: terminated ? crlf ? "\r\n" : "\n" : "" };
+  };
+  try {
+    if (descriptorHasExclusionMarker(input2)) return;
+    assertUnchangedInput(file2, initial);
+    screener = createRecordScreener(policy);
+    stream = fs2.createReadStream(file2, { fd: input2, autoClose: true, start: 0 });
+    for await (const chunk of stream) {
+      assertUnchangedInput(file2, initial);
+      assertUnchangedPolicy(policySnapshot);
+      pending = Buffer.concat([pending, chunk]);
+      let newline;
+      while ((newline = pending.indexOf(10)) !== -1) {
+        yield admit(pending.subarray(0, newline), true);
+        pending = pending.subarray(newline + 1);
+      }
+      if (pending.length > 64 * 1024 * 1024) throw new Error("Conversation record exceeds admission byte limit");
+    }
+    if (pending.length) yield admit(pending, false);
+    assertUnchangedInput(file2, initial);
+    assertUnchangedPolicy(policySnapshot);
+  } finally {
+    if (stream) stream.destroy();
+    else fs2.closeSync(input2);
+    screener?.close();
+  }
+}
+async function readAdmittedConversation(file2, startLine = 1, endLine = Infinity) {
+  if (!Number.isSafeInteger(startLine) || startLine < 1 || endLine !== Infinity && (!Number.isSafeInteger(endLine) || endLine < startLine)) {
+    throw new Error("Invalid conversation line range");
+  }
+  const lines = [];
+  for await (const record2 of admittedRecords(file2, readRecordExclusions(), startLine, endLine)) lines.push(record2.line);
+  return lines.join("\n");
+}
+function admitExchange(exchange, policy = readRecordExclusions()) {
+  if (!policy) return exchange;
+  const sessionIds = [exchange.sessionId, sessionFromPath(exchange.archivePath)].filter((id) => !!id);
+  const transcript = path2.basename(exchange.archivePath);
+  if (policy.exchanges.some((x2) => sessionIds.includes(x2.session_id) && x2.transcript === transcript && exchange.lineStart <= x2.line_end && exchange.lineEnd >= x2.line_start)) return null;
+  const kept = exchange.toolCalls?.filter((call) => !sessionIds.some((id) => blockedCall(policy, id, transcript, call.id)));
+  const admitted = kept && kept.length !== exchange.toolCalls?.length ? { ...exchange, toolCalls: kept } : exchange;
+  const screener = createRecordScreener(policy);
+  try {
+    screener.scan(admitted.userMessage);
+    screener.scan(admitted.assistantMessage);
+    for (const call of admitted.toolCalls ?? []) screener.scan(call);
+    const { userMessage, assistantMessage, toolCalls, ...metadata } = admitted;
+    screener.scan(metadata);
+    return admitted;
+  } finally {
+    screener.close();
+  }
+}
+function createSearchAdmission() {
+  const policy = readRecordExclusions();
+  const policySnapshot = JSON.stringify(policy);
+  const files = /* @__PURE__ */ new Map();
+  const checkFile = (file2) => {
+    assertUnchangedPolicy(policySnapshot);
+    const cached2 = files.get(file2);
+    if (cached2) return !cached2.excluded;
+    let fd;
+    try {
+      const pathInfo = fs2.lstatSync(file2);
+      if (!pathInfo.isFile()) throw new Error("Conversation changed during record admission");
+      fd = fs2.openSync(file2, fs2.constants.O_RDONLY | fs2.constants.O_NOFOLLOW);
+      const initial = fs2.fstatSync(fd);
+      if (!initial.isFile() || initial.dev !== pathInfo.dev || initial.ino !== pathInfo.ino || !Number.isSafeInteger(initial.size)) throw new Error("Conversation changed during record admission");
+      const hash2 = crypto.createHash("sha256");
+      const excluded = descriptorHasExclusionMarker(fd, initial.size, hash2);
+      files.set(file2, { initial, excluded, digest: excluded ? void 0 : hash2.digest("hex") });
+      return !excluded;
+    } catch {
+      throw new Error("Conversation changed during record admission");
+    } finally {
+      if (fd !== void 0) fs2.closeSync(fd);
+    }
+  };
+  return {
+    admit(exchange) {
+      if (!checkFile(exchange.archivePath)) return null;
+      const admitted = admitExchange(exchange, policy);
+      assertUnchangedPolicy(policySnapshot);
+      return admitted;
+    },
+    summary(exchange, text) {
+      const ids = [exchange.sessionId, sessionFromPath(exchange.archivePath)];
+      const transcript = path2.basename(exchange.archivePath);
+      if (policy && [...policy.exchanges, ...policy.tool_calls].some((row) => row.transcript === transcript && ids.includes(row.session_id))) return void 0;
+      return admitExchange({ ...exchange, userMessage: text, assistantMessage: "", toolCalls: [] }, policy) ? text : void 0;
+    },
+    verify() {
+      assertUnchangedPolicy(policySnapshot);
+      for (const [file2, { initial, digest }] of files) {
+        if (digest !== void 0) assertUnchangedSearchPrefix(file2, initial, digest);
+      }
+      assertUnchangedPolicy(policySnapshot);
+    }
+  };
+}
+
+// src/db.ts
+import path3 from "path";
+import fs3 from "fs";
+import * as sqliteVec from "sqlite-vec";
 
 // src/file-lock.ts
 import * as lockfile from "proper-lockfile";
@@ -35162,9 +35593,9 @@ function migrateToolCallsCascade(db) {
 }
 function initDatabase() {
   const dbPath = getDbPath();
-  const dbDir = path2.dirname(dbPath);
-  if (!fs2.existsSync(dbDir)) {
-    fs2.mkdirSync(dbDir, { recursive: true });
+  const dbDir = path3.dirname(dbPath);
+  if (!fs3.existsSync(dbDir)) {
+    fs3.mkdirSync(dbDir, { recursive: true });
   }
   const db = new Database(dbPath);
   sqliteVec.load(db);
@@ -35334,7 +35765,7 @@ function isErroredSentinel(content) {
 }
 
 // src/search.ts
-import fs3 from "fs";
+import fs4 from "fs";
 import readline from "readline";
 var SIDECHAIN_DISTANCE_PENALTY = 0.05;
 function buildSearchFilters(options) {
@@ -35452,84 +35883,88 @@ async function searchConversations(query, options = {}) {
   const sidechainClause = includeSidechains ? "" : "AND e.is_sidechain = 0";
   if (after) validateISODate(after, "--after");
   if (before) validateISODate(before, "--before");
+  const admission = createSearchAdmission();
   const db = initDatabase();
+  const admitted = (row) => admission.admit(exchangeFromRow(row)) !== null;
   let results = [];
   const { sql: filterClause, params: filterParams } = buildSearchFilters(options);
-  if (mode === "vector" || mode === "both") {
-    await initEmbeddings();
-    const queryEmbedding = await generateQueryEmbedding(query);
-    const k2 = limit * 3;
-    const stmt = db.prepare(`
-      SELECT
-        ${EXCHANGE_SELECT_COLUMNS},
-        vec.distance
-      FROM vec_exchanges AS vec
-      JOIN exchanges AS e ON vec.id = e.id
-      WHERE vec.embedding MATCH ?
-        AND k = ?
-        ${sidechainClause}
-        ${filterClause}
-      ORDER BY (vec.distance + e.is_sidechain * ?) ASC
-    `);
-    results = stmt.all(
-      Buffer.from(new Float32Array(queryEmbedding).buffer),
-      k2,
-      ...filterParams,
-      SIDECHAIN_DISTANCE_PENALTY
-    );
-    if (results.length > limit) {
-      results = results.slice(0, limit);
-    }
-  }
-  if (mode === "text" || mode === "both") {
-    const { sql: textMatchSql, params: textMatchParams } = buildTextMatchClause(query);
-    const textStmt = db.prepare(`
-      SELECT
-        ${EXCHANGE_SELECT_COLUMNS},
-        0 as distance
-      FROM exchanges AS e
-      WHERE ${textMatchSql}
-        ${sidechainClause}
-        ${filterClause}
-      ORDER BY e.is_sidechain ASC, e.timestamp DESC
-      LIMIT ?
-    `);
-    const textResults = textStmt.all(...textMatchParams, ...filterParams, limit);
-    if (mode === "both") {
-      const seenIds = new Set(results.map((r) => r.id));
-      for (const textResult of textResults) {
-        if (!seenIds.has(textResult.id)) {
-          results.push(textResult);
-        }
+  try {
+    if (mode === "vector" || mode === "both") {
+      await initEmbeddings();
+      const queryEmbedding = await generateQueryEmbedding(query);
+      const stmt = db.prepare(`
+        SELECT ${EXCHANGE_SELECT_COLUMNS},
+          vec_distance_l2(vec.embedding, ?) AS retrieval_distance
+        FROM vec_exchanges AS vec
+        JOIN exchanges AS e ON vec.id = e.id
+        WHERE 1 = 1 ${sidechainClause} ${filterClause}
+        ORDER BY (retrieval_distance + e.is_sidechain * ?) ASC
+      `);
+      for (const row of stmt.iterate(
+        Buffer.from(new Float32Array(queryEmbedding).buffer),
+        ...filterParams,
+        SIDECHAIN_DISTANCE_PENALTY
+      )) {
+        if (admitted(row)) results.push(row);
+        if (results.length === limit) break;
       }
-    } else {
-      results = textResults;
     }
+    if (mode === "text" || mode === "both") {
+      const { sql: textMatchSql, params: textMatchParams } = buildTextMatchClause(query);
+      const textStmt = db.prepare(`
+        SELECT
+          ${EXCHANGE_SELECT_COLUMNS},
+          0 as retrieval_distance
+        FROM exchanges AS e
+        WHERE ${textMatchSql}
+          ${sidechainClause}
+          ${filterClause}
+        ORDER BY e.is_sidechain ASC, e.timestamp DESC
+      `);
+      const textResults = [];
+      for (const row of textStmt.iterate(...textMatchParams, ...filterParams)) {
+        if (admitted(row)) textResults.push(row);
+        if (textResults.length === limit) break;
+      }
+      if (mode === "both") {
+        const seenIds = new Set(results.map((r) => r.id));
+        for (const textResult of textResults) {
+          if (!seenIds.has(textResult.id)) {
+            results.push(textResult);
+          }
+        }
+      } else {
+        results = textResults;
+      }
+    }
+  } finally {
+    db.close();
   }
-  db.close();
-  return results.map((row) => {
+  const output2 = results.map((row) => {
     const exchange = exchangeFromRow(row);
     const summaryPath = row.archive_path.replace(".jsonl", "-summary.txt");
     let summary;
-    if (fs3.existsSync(summaryPath)) {
-      const raw = fs3.readFileSync(summaryPath, "utf-8");
+    if (fs4.existsSync(summaryPath)) {
+      const raw = fs4.readFileSync(summaryPath, "utf-8");
       if (!isErroredSentinel(raw)) {
-        summary = raw.trim();
+        summary = admission.summary(exchange, raw.trim());
       }
     }
     const snippetText = exchange.userMessage.substring(0, 200).replace(/\s+/g, " ").trim();
     const snippet = snippetText + (exchange.userMessage.length > 200 ? "..." : "");
     return {
       exchange,
-      similarity: mode === "text" ? void 0 : l2DistanceToCosineSimilarity(row.distance),
+      similarity: mode === "text" ? void 0 : l2DistanceToCosineSimilarity(row.retrieval_distance),
       snippet,
       summary
     };
   });
+  admission.verify();
+  return output2;
 }
 async function countLines(filePath) {
   try {
-    const fileStream = fs3.createReadStream(filePath);
+    const fileStream = fs4.createReadStream(filePath);
     const rl = readline.createInterface({
       input: fileStream,
       crlfDelay: Infinity
@@ -35545,7 +35980,7 @@ async function countLines(filePath) {
 }
 function getFileSizeInKB(filePath) {
   try {
-    const stats = fs3.statSync(filePath);
+    const stats = fs4.statSync(filePath);
     return Math.round(stats.size / 1024 * 10) / 10;
   } catch (error61) {
     return 0;
@@ -36826,11 +37261,12 @@ var Kt = x.lex;
 
 // src/show.ts
 function formatConversationAsMarkdown(jsonl, startLine, endLine) {
-  const allLines = jsonl.trim().split("\n").filter((line) => line.trim());
-  const lines = startLine !== void 0 || endLine !== void 0 ? allLines.slice(
+  const allLines = jsonl.split("\n");
+  const selectedLines = startLine !== void 0 || endLine !== void 0 ? allLines.slice(
     startLine !== void 0 ? startLine - 1 : 0,
     endLine !== void 0 ? endLine : void 0
   ) : allLines;
+  const lines = selectedLines.filter((line) => line.trim());
   if (isCodexRollout(lines)) {
     return formatCodexConversationAsMarkdown(lines);
   }
@@ -37495,7 +37931,7 @@ function formatCursorConversationAsMarkdown(lines) {
 var VERSION = "1.6.0";
 
 // src/mcp-server.ts
-import fs4 from "fs";
+import fs5 from "fs";
 var SearchModeEnum = external_exports.enum(["vector", "text", "both"]);
 var ResponseFormatEnum = external_exports.enum(["markdown", "json"]);
 var SearchInputSchema = external_exports.object({
@@ -37674,10 +38110,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
     if (name === "read") {
       const params = ShowConversationInputSchema.parse(args);
-      if (!fs4.existsSync(params.path)) {
+      if (!fs5.existsSync(params.path)) {
         throw new Error(`File not found: ${params.path}`);
       }
-      const jsonlContent = fs4.readFileSync(params.path, "utf-8");
+      const jsonlContent = await readAdmittedConversation(params.path, params.startLine, params.endLine);
       const markdownContent = formatConversationAsMarkdown(
         jsonlContent,
         params.startLine,

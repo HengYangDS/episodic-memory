@@ -75,6 +75,8 @@ async function main() {
         console.log(`Orphaned entries: ${issues.orphaned.length}`);
         console.log(`Outdated files: ${issues.outdated.length}`);
         console.log(`Archive refreshes (no new exchanges): ${issues.archiveRefreshes.length}`);
+        console.log(`Screening-rejected archives: ${issues.screeningRejected.length}`);
+        console.log(`Screening-unavailable archives: ${issues.screeningUnavailable.length}`);
         console.log(`Corrupted files: ${issues.corrupted.length}`);
 
         if (issues.missing.length > 0) {
@@ -90,7 +92,8 @@ async function main() {
           issues.outdated.forEach(item => console.log(`  ${item.path}`));
         }
 
-        if (issues.missing.length + issues.unindexed.length + issues.orphaned.length + issues.outdated.length + issues.corrupted.length > 0) {
+        if (issues.missing.length + issues.unindexed.length + issues.orphaned.length + issues.outdated.length +
+            issues.screeningRejected.length + issues.screeningUnavailable.length + issues.corrupted.length > 0) {
           console.log('\nReview exact candidates before repair; --repair may regenerate summaries and embeddings.');
           process.exit(1);
         } else {
@@ -102,6 +105,11 @@ async function main() {
         console.log('Verifying conversation index...');
         const repairIssues = await verifyIndex();
 
+        if (repairIssues.screeningRejected.length + repairIssues.screeningUnavailable.length > 0) {
+          console.error('Record screening failures require review; repair was not started.');
+          process.exitCode = 1;
+          break;
+        }
         if (repairIssues.unindexed.length > 0) {
           console.log(`${repairIssues.unindexed.length} unindexed archive(s) require separate review; --repair does not select them by this status alone.`);
           process.exitCode = 1;
