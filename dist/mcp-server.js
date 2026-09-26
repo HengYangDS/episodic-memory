@@ -35695,6 +35695,7 @@ async function initEmbeddings() {
   try {
     const transformers = await import("@huggingface/transformers");
     transformers.env.allowLocalModels = true;
+    transformers.env.allowRemoteModels = false;
     transformers.env.useBrowserCache = false;
     pipeline = transformers.pipeline;
   } catch (error61) {
@@ -37910,7 +37911,7 @@ function formatCursorConversationAsMarkdown(lines) {
 }
 
 // src/version.ts
-var VERSION = "1.6.0+codex.20260916014656";
+var VERSION = "1.6.0+codex.20260926000959";
 
 // src/mcp-server.ts
 import fs5 from "fs";

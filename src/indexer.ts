@@ -242,6 +242,9 @@ export async function indexSession(sessionId: string, concurrency: number = 1, n
       fs.mkdirSync(projectArchive, { recursive: true });
 
       const archivePath = path.join(projectArchive, file);
+      const maxIndexedLine = (db.prepare(
+        'SELECT COALESCE(MAX(line_end), 0) AS maxLine FROM exchanges WHERE archive_path = ?'
+      ).get(archivePath) as { maxLine: number }).maxLine;
 
       // Archive + parse — source may vanish mid-run (Claude Code cleanup).
       let exchanges;
@@ -256,6 +259,7 @@ export async function indexSession(sessionId: string, concurrency: number = 1, n
       }
 
       if (exchanges.length > 0) {
+        const newExchanges = exchanges.filter(exchange => exchange.lineStart > maxIndexedLine);
         // Generate summary (unless --no-summaries)
         const summaryPath = archivePath.replace('.jsonl', '-summary.txt');
         if (!noSummaries && shouldQueueForSummary(summaryPath)) {
@@ -274,7 +278,7 @@ export async function indexSession(sessionId: string, concurrency: number = 1, n
         // Index
         const maxMessageBytes = getMaxMessageBytes();
         let oversizeSkipped = 0;
-        for (const exchange of exchanges) {
+        for (const exchange of newExchanges) {
           // Skip oversize single messages BEFORE embedding — a foreign
           // summarizer's pasted transcript is noise, and embedding it is the
           // expensive waste (#139).
@@ -295,7 +299,7 @@ export async function indexSession(sessionId: string, concurrency: number = 1, n
           console.log(`  Skipped ${oversizeSkipped} oversize exchange(s) (> ${maxMessageBytes} bytes; set EPISODIC_MEMORY_MAX_MESSAGE_BYTES to change) — likely embedded-transcript payloads (#139)`);
         }
 
-        console.log(`✅ Indexed session ${sessionId}: ${exchanges.length} exchanges`);
+        console.log(`✅ Indexed session ${sessionId}: ${newExchanges.length} new exchanges`);
       }
 
       db.close();

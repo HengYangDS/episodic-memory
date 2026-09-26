@@ -17,9 +17,9 @@ const syncLock = acquireFileLock(syncLockPath);
 if (!syncLock) {
   const holder = readLockHolder(syncLockPath);
   const holderLabel = holder !== null ? `pid ${holder}` : 'another process';
-  // stderr keeps this out of stdout consumers; status 0 so hooks don't fail.
+  // Hooks may skip a contended write, but a skipped verifier is not a result.
   console.error(`episodic-memory: sync already running (${holderLabel}); skipping`);
-  process.exit(0);
+  process.exit(command === 'verify' ? 2 : 0);
 }
 const releaseSyncLockOnce = () => {
   if ((releaseSyncLockOnce as any).done) return;
@@ -70,18 +70,20 @@ async function main() {
         const issues = await verifyIndex();
 
         console.log('\n=== Verification Results ===');
+        console.log(`Checked archives: ${issues.checkedFiles}`);
+        console.log(`Parsed changed archives: ${issues.parsedFiles}`);
         console.log(`Missing summaries: ${issues.missing.length}`);
+        console.log(`Unindexed archives: ${issues.unindexed.length}`);
         console.log(`Orphaned entries: ${issues.orphaned.length}`);
-        console.log(`Outdated files: ${issues.outdated.length}`);
-        console.log(`Corrupted files: ${issues.corrupted.length}`);
+        console.log(`True incremental files: ${issues.outdated.length}`);
+        console.log(`Archive refreshes: ${issues.archiveRefreshes.length}`);
+        console.log(`Screening-rejected changed archives: ${issues.screeningRejected.length}`);
+        console.log(`Screening-unavailable changed archives: ${issues.screeningUnavailable.length}`);
+        console.log(`Corrupted changed archives: ${issues.corrupted.length}`);
 
-        if (issues.missing.length > 0) {
-          console.log('\nMissing summaries:');
-          issues.missing.forEach(m => console.log(`  ${m.path}`));
-        }
-
-        if (issues.missing.length + issues.orphaned.length + issues.outdated.length + issues.corrupted.length > 0) {
-          console.log('\nRun with --repair to fix these issues.');
+        if (issues.missing.length + issues.unindexed.length + issues.orphaned.length +
+            issues.outdated.length + issues.screeningUnavailable.length + issues.corrupted.length > 0) {
+          console.log('\nReview exact candidates before indexing or summarizing. --repair may re-embed and call a model.');
           process.exit(1);
         } else {
           console.log('\n✅ Index is healthy!');

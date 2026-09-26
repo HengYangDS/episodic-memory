@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, rmSync } from 'f
 import { join } from 'path';
 import { tmpdir } from 'os';
 import Database from 'better-sqlite3';
-import { indexUnprocessed } from '../src/indexer.js';
+import { indexSession, indexUnprocessed } from '../src/indexer.js';
 import { suppressConsole } from './test-utils.js';
 
 /**
@@ -104,5 +104,28 @@ describe('indexer: incremental indexing', () => {
     );
     await indexUnprocessed(1, true);
     expect(countExchanges()).toBe(5);
+  });
+
+  it('preserves indexed rows when a session gains a later exchange', async () => {
+    const projectDir = join(projectsDir, 'project-a');
+    mkdirSync(projectDir, { recursive: true });
+    const transcriptPath = join(projectDir, 'session-1.jsonl');
+    writeFileSync(transcriptPath, makeExchangeLines(1, 'session-1'), 'utf-8');
+    await indexSession('session-1', 1, true);
+
+    const before = new Database(dbPath);
+    before.prepare('UPDATE exchanges SET last_indexed = ? WHERE line_start = 1').run(123);
+    before.close();
+    appendFileSync(transcriptPath, makeExchangeLines(2, 'session-1'), 'utf-8');
+    await indexSession('session-1', 1, true);
+
+    const after = new Database(dbPath);
+    const rows = after.prepare('SELECT line_start AS lineStart, last_indexed AS lastIndexed FROM exchanges ORDER BY line_start')
+      .all() as Array<{ lineStart: number; lastIndexed: number }>;
+    after.close();
+    expect(rows).toHaveLength(2);
+    expect(rows[0]).toEqual({ lineStart: 1, lastIndexed: 123 });
+    expect(rows[1].lineStart).toBe(3);
+    expect(rows[1].lastIndexed).toBeGreaterThan(123);
   });
 });

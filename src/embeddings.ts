@@ -79,9 +79,10 @@ export async function initEmbeddings(): Promise<void> {
   let pipeline: typeof import('@huggingface/transformers').pipeline;
   try {
     const transformers = await import('@huggingface/transformers');
-    // Disable progress callbacks / remote cache to prevent stdout pollution in
-    // MCP context, where stdout is reserved for JSON-RPC communication.
+    // Use only the installed local model cache. An absent model must fail
+    // instead of starting an implicit network download during indexing.
     transformers.env.allowLocalModels = true;
+    transformers.env.allowRemoteModels = false;
     transformers.env.useBrowserCache = false;
     pipeline = transformers.pipeline;
   } catch (error) {

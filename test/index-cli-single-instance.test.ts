@@ -75,13 +75,13 @@ describe('index-cli single-instance lock (#97)', () => {
     expect(existsSync(join(testDir, 'test.db'))).toBe(false);
   });
 
-  it('skips `verify`, which can initialize and migrate the database', () => {
+  it('reports lock contention for `verify` as incomplete verification', () => {
     heldLock = acquireFileLock(lockPath);
     expect(heldLock).not.toBeNull();
 
     const result = runIndexCli(['verify']);
 
-    expect(result.status).toBe(0);
+    expect(result.status).toBe(2);
     expect(result.stderr).toMatch(/sync already running.*skipping/);
     expect(result.stdout).not.toMatch(/Verifying conversation index/);
     expect(existsSync(join(testDir, 'test.db'))).toBe(false);
