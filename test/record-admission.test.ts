@@ -229,6 +229,16 @@ describe('persistent record exclusion at native ingestion boundaries', () => {
     expect(fs.readFileSync(archiveFile, 'utf8')).toBe(bytes);
   });
 
+  it('refreshes an archive when the source grows but its mtime ties the archive', async () => {
+    expect(await archiveAdmittedConversation(sourceFile, archiveFile)).toBe(true);
+    const archiveTime = fs.statSync(archiveFile).mtime;
+    fs.appendFileSync(sourceFile, JSON.stringify(message('user', 'An appended safe exchange')) + '\n');
+    fs.utimesSync(sourceFile, archiveTime, archiveTime);
+
+    expect(await archiveAdmittedConversation(sourceFile, archiveFile)).toBe(true);
+    expect(fs.readFileSync(archiveFile)).toEqual(fs.readFileSync(sourceFile));
+  });
+
   it('rejects source mutation during streaming without publishing a derived file', async () => {
     policy();
     const original = fs.createReadStream;
@@ -357,6 +367,24 @@ describe('persistent record exclusion at native ingestion boundaries', () => {
     expect(request.options.resume).toBeUndefined();
     expect(request.prompt).toContain(exchange.userMessage);
     expect(request.prompt).not.toContain(PRIVATE);
+  });
+
+  it('does not route a policy-admitted Codex transcript without a session ID to Claude', async () => {
+    policy();
+    process.env.EPISODIC_MEMORY_CODEX_BIN = path.join(root, 'missing-codex');
+    vi.mocked(query).mockReset();
+    vi.mocked(query).mockReturnValue({
+      async *[Symbol.asyncIterator]() {
+        yield { type: 'result', is_error: false, result: '<summary>Wrong provider.</summary>' };
+      },
+    } as any);
+    const exchange: ConversationExchange = { id: 'codex-no-id', project: 'fixture',
+      timestamp: '2026-01-01T00:00:00Z', userMessage: 'Explain the selected project architecture and its acceptance boundaries.',
+      assistantMessage: 'This admitted answer is long enough to require a summary but must never reach a different provider.',
+      archivePath: archiveFile, lineStart: 2, lineEnd: 3, harness: 'codex' };
+
+    await expect(summarizeConversation([exchange])).rejects.toThrow();
+    expect(query).not.toHaveBeenCalled();
   });
 
   it('refuses direct database reinsertion after native deletion across reopen', () => {

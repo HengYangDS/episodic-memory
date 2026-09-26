@@ -141,10 +141,10 @@ export async function syncConversations(sourceDir, destDir, options = {}) {
                 if (!options.skipSummaries) {
                     const summaryPath = destFile.replace('.jsonl', '-summary.txt');
                     if (shouldQueueForSummary(summaryPath) && !shouldSkipConversation(destFile)) {
-                        // sessionId enables Claude session-resume summarization; when the
-                        // filename has no UUID to extract (e.g. subagent transcripts named
-                        // agent-<hex>.jsonl), queue anyway — summarizeConversation falls
-                        // back to summarizing from the transcript text.
+                        // sessionId enables source-session summarization. When the filename
+                        // has no UUID (e.g. agent-<hex>.jsonl), queue anyway: Codex uses an
+                        // isolated transcript-only thread; other harnesses use their own
+                        // transcript-text route without resuming a source session.
                         const sessionId = extractSessionIdFromPath(destFile) ?? undefined;
                         filesToSummarize.push({ path: destFile, sessionId });
                     }

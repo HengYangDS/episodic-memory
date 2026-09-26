@@ -1,6 +1,4 @@
 export interface VerificationResult {
-    checkedFiles: number;
-    parsedFiles: number;
     missing: Array<{
         path: string;
         reason: string;
@@ -34,4 +32,4 @@ export interface VerificationResult {
     }>;
 }
 export declare function verifyIndex(): Promise<VerificationResult>;
-export declare function repairIndex(issues: Pick<VerificationResult, 'missing' | 'orphaned' | 'outdated' | 'corrupted'>): Promise<void>;
+export declare function repairIndex(issues: VerificationResult): Promise<void>;

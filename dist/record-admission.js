@@ -515,13 +515,14 @@ export async function archiveAdmittedConversation(source, destination, policy = 
     const original = fs.lstatSync(source);
     if (!original.isFile())
         throw new Error('Conversation source must be a regular non-symlink file');
+    let target;
     if (fs.existsSync(destination)) {
-        const target = fs.lstatSync(destination);
+        target = fs.lstatSync(destination);
         if (!target.isFile() || target.dev === original.dev && target.ino === original.ino) {
             throw new Error('Source and derived archive must be distinct regular files');
         }
     }
-    if (!policy && fs.existsSync(destination) && fs.statSync(destination).mtimeMs >= original.mtimeMs)
+    if (!policy && target && target.mtimeMs >= original.mtimeMs && target.size === original.size)
         return false;
     const initial = fs.statSync(source);
     const parent = prepareArchiveParent(path.dirname(path.resolve(destination)));

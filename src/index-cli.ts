@@ -10,14 +10,14 @@ import { acquireFileLock, readLockHolder, releaseFileLock } from './file-lock.js
 
 const command = process.argv[2];
 
-// Serialize the whole CLI with `sync-cli`: every command can initialize or
-// migrate the database, and rebuild also deletes the database and summaries.
+// Serialize the whole CLI with `sync-cli`: writers mutate the index/archive,
+// and verification must not claim a consistent result while one is active.
 const syncLockPath = getSyncLockPath();
 const syncLock = acquireFileLock(syncLockPath);
 if (!syncLock) {
   const holder = readLockHolder(syncLockPath);
   const holderLabel = holder !== null ? `pid ${holder}` : 'another process';
-  // Hooks may skip a contended write, but a skipped verifier is not a result.
+  // A skipped write may be retried by a hook; a skipped verifier is not a result.
   console.error(`episodic-memory: sync already running (${holderLabel}); skipping`);
   process.exit(command === 'verify' ? 2 : 0);
 }
@@ -70,20 +70,31 @@ async function main() {
         const issues = await verifyIndex();
 
         console.log('\n=== Verification Results ===');
-        console.log(`Checked archives: ${issues.checkedFiles}`);
-        console.log(`Parsed changed archives: ${issues.parsedFiles}`);
         console.log(`Missing summaries: ${issues.missing.length}`);
         console.log(`Unindexed archives: ${issues.unindexed.length}`);
         console.log(`Orphaned entries: ${issues.orphaned.length}`);
-        console.log(`True incremental files: ${issues.outdated.length}`);
-        console.log(`Archive refreshes: ${issues.archiveRefreshes.length}`);
-        console.log(`Screening-rejected changed archives: ${issues.screeningRejected.length}`);
-        console.log(`Screening-unavailable changed archives: ${issues.screeningUnavailable.length}`);
-        console.log(`Corrupted changed archives: ${issues.corrupted.length}`);
+        console.log(`Outdated files: ${issues.outdated.length}`);
+        console.log(`Archive refreshes (no new exchanges): ${issues.archiveRefreshes.length}`);
+        console.log(`Screening-rejected archives: ${issues.screeningRejected.length}`);
+        console.log(`Screening-unavailable archives: ${issues.screeningUnavailable.length}`);
+        console.log(`Corrupted files: ${issues.corrupted.length}`);
 
-        if (issues.missing.length + issues.unindexed.length + issues.orphaned.length +
-            issues.outdated.length + issues.screeningUnavailable.length + issues.corrupted.length > 0) {
-          console.log('\nReview exact candidates before indexing or summarizing. --repair may re-embed and call a model.');
+        if (issues.missing.length > 0) {
+          console.log('\nMissing summaries:');
+          issues.missing.forEach(m => console.log(`  ${m.path}`));
+        }
+        if (issues.unindexed.length > 0) {
+          console.log('\nUnindexed archives:');
+          issues.unindexed.forEach(item => console.log(`  ${item.path}`));
+        }
+        if (issues.outdated.length > 0) {
+          console.log('\nArchives with appended exchanges:');
+          issues.outdated.forEach(item => console.log(`  ${item.path}`));
+        }
+
+        if (issues.missing.length + issues.unindexed.length + issues.orphaned.length + issues.outdated.length +
+            issues.screeningRejected.length + issues.screeningUnavailable.length + issues.corrupted.length > 0) {
+          console.log('\nReview exact candidates before repair; --repair may regenerate summaries and embeddings.');
           process.exit(1);
         } else {
           console.log('\n✅ Index is healthy!');
@@ -94,9 +105,18 @@ async function main() {
         console.log('Verifying conversation index...');
         const repairIssues = await verifyIndex();
 
+        if (repairIssues.screeningRejected.length + repairIssues.screeningUnavailable.length > 0) {
+          console.error('Record screening failures require review; repair was not started.');
+          process.exitCode = 1;
+          break;
+        }
+        if (repairIssues.unindexed.length > 0) {
+          console.log(`${repairIssues.unindexed.length} unindexed archive(s) require separate review; --repair does not select them by this status alone.`);
+          process.exitCode = 1;
+        }
         if (repairIssues.missing.length + repairIssues.orphaned.length + repairIssues.outdated.length > 0) {
           await repairIndex(repairIssues);
-        } else {
+        } else if (repairIssues.unindexed.length === 0) {
           console.log('✅ No issues to repair!');
         }
         break;

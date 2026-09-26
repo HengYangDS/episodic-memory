@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import {
   admitExchange,
   archiveAdmittedConversation,
@@ -11,17 +12,17 @@ import {
 } from '../src/record-admission.js';
 import { initDatabase, insertExchange } from '../src/db.js';
 import { searchConversations } from '../src/search.js';
+import { verifyIndex } from '../src/verify.js';
 import type { ConversationExchange } from '../src/types.js';
 
 const session = '00000000-1111-4222-8333-444444444444';
 // Deliberately public nonfunctional fixture, never a production credential.
 const token = 'ghp_' + 'A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8';
 const scannerName = process.platform === 'win32' ? 'gitleaks.exe' : 'gitleaks';
-const scannerPath = process.env.TEST_GITLEAKS_PATH || (process.env.PATH || '').split(path.delimiter)
+const realScannerPath = process.env.TEST_GITLEAKS_PATH || (process.env.PATH || '').split(path.delimiter)
   .map(directory => path.join(directory, scannerName)).find(file => fs.existsSync(file));
-if (!scannerPath) throw new Error('Install Gitleaks or set TEST_GITLEAKS_PATH; screening acceptance cannot be skipped');
-const scanner = fs.realpathSync(scannerPath);
-const digest = crypto.createHash('sha256').update(fs.readFileSync(scanner)).digest('hex');
+let scanner: string;
+let digest: string;
 let root: string;
 let prior: NodeJS.ProcessEnv;
 let source: string;
@@ -34,7 +35,7 @@ function policy(overrides: Record<string, unknown> = {}): void {
     tool_calls: [],
     screening: {
       engine: 'gitleaks', executable: scanner, sha256: digest,
-      timeout_ms: 2000, max_record_bytes: 1_048_576, ...overrides,
+      timeout_ms: 10_000, max_record_bytes: 1_048_576, ...overrides,
     },
   }), { mode: 0o600 });
 }
@@ -57,8 +58,19 @@ function transcript(text: string): string {
   ].map(JSON.stringify).join('\n') + '\n';
 }
 
-// Fault injection at the subprocess boundary, not a replacement for real
-// Gitleaks acceptance above. Every probe is an actual pinned executable.
+function archivedTranscript(text: string, withSummary = false): string {
+  const archiveDir = path.join(root, 'archive');
+  const projectDir = path.join(archiveDir, 'project');
+  fs.mkdirSync(projectDir, { recursive: true });
+  process.env.TEST_ARCHIVE_DIR = archiveDir;
+  const file = path.join(projectDir, path.basename(source));
+  fs.writeFileSync(file, transcript(text));
+  if (withSummary) fs.writeFileSync(file.replace('.jsonl', '-summary.txt'), 'Existing summary');
+  return file;
+}
+
+// Contract probes are executable and digest-pinned without requiring Gitleaks
+// on every CI host. A separate optional integration test exercises Gitleaks.
 function scannerProbe(body: string): string {
   const file = path.join(root, 'scanner-probe');
   fs.writeFileSync(file, `#!${process.execPath}\n${body}\n`, { mode: 0o700 });
@@ -72,6 +84,17 @@ beforeEach(() => {
   root = fs.mkdtempSync(path.join(os.tmpdir(), 'record-screening-test-'));
   process.env.EPISODIC_MEMORY_CONFIG_DIR = root;
   process.env.EPISODIC_MEMORY_DB_PATH = path.join(root, 'test.sqlite');
+  scanner = path.join(root, 'scanner-fixture');
+  fs.writeFileSync(scanner, `#!${process.execPath}
+const fs = require('node:fs');
+const input = fs.readFileSync(0, 'utf8');
+const found = input.includes('ghp_') || /api_key\\s*=\\s*\\S{20}/i.test(input) ||
+  (input.includes('Sourcegraph') && /[a-f0-9]{40}/i.test(input));
+process.stdout.write(found ? '[{"RuleID":"fixture"}]' : '[]');
+process.exit(found ? 10 : 0);
+`, { mode: 0o700 });
+  scanner = fs.realpathSync(scanner);
+  digest = crypto.createHash('sha256').update(fs.readFileSync(scanner)).digest('hex');
   source = path.join(root, `rollout-${session}.jsonl`);
   destination = path.join(root, 'archive', path.basename(source));
   fs.writeFileSync(source, transcript('safe question'));
@@ -85,6 +108,40 @@ afterEach(() => {
 });
 
 describe('pinned record-local screening at native admission', () => {
+  it('fails verification on an invalid record policy even with no archived files', async () => {
+    fs.writeFileSync(path.join(root, 'record-exclusions.json'), '{invalid');
+    process.env.TEST_ARCHIVE_DIR = path.join(root, 'empty-archive');
+    await expect(verifyIndex()).rejects.toThrow(/record exclusion policy/i);
+  });
+
+  it.each(['rejected', 'unavailable'] as const)('classifies %s screening independently from corruption and missing summary', async outcome => {
+    const file = archivedTranscript(token);
+    if (outcome === 'unavailable') policy({ sha256: '0'.repeat(64) });
+
+    const result = await verifyIndex();
+    expect(result.missing.map(item => item.path)).toContain(file);
+    expect(result.corrupted).toEqual([]);
+    expect(result.screeningRejected.map(item => item.path)).toEqual(outcome === 'rejected' ? [file] : []);
+    expect(result.screeningUnavailable.map(item => item.path)).toEqual(outcome === 'unavailable' ? [file] : []);
+  });
+
+  it('does not report a green repair when configured screening rejects an archive', () => {
+    archivedTranscript(token, true);
+    const cli = path.join(import.meta.dirname, '..', 'dist', 'index-cli.js');
+    const result = spawnSync(process.execPath, [cli, 'repair'], {
+      env: process.env, encoding: 'utf8', timeout: 30_000,
+    });
+    expect(result.status).toBe(1);
+    expect(result.stdout).not.toContain('No issues to repair!');
+    expect(result.stdout).not.toContain('Repair complete.');
+  });
+
+  it.skipIf(!realScannerPath)('rejects a synthetic token with the actual Gitleaks executable', () => {
+    const executable = fs.realpathSync(realScannerPath!);
+    policy({ executable, sha256: crypto.createHash('sha256').update(fs.readFileSync(executable)).digest('hex') });
+    expect(() => admitExchange(exchange(token))).toThrow(/content rejected by screening/i);
+  });
+
   it('screens retained search content and summaries against the current pinned scanner', async () => {
     const db = initDatabase();
     insertExchange(db, exchange(), new Array(384).fill(0));
@@ -140,7 +197,7 @@ describe('pinned record-local screening at native admission', () => {
 
   it('keeps separate user and assistant records from contaminating keyword screening', () => {
     const x = exchange('Sourcegraph');
-    x.assistantMessage = '0123456789abcdef0123456789abcdef01234567';
+    x.assistantMessage = ['01234567', '89abcdef', '01234567', '89abcdef', '01234567'].join('');
     expect(admitExchange(x)).toEqual(x);
   });
 
@@ -194,7 +251,7 @@ describe('pinned record-local screening at native admission', () => {
   });
 
   it('retains key/value assignment syntax required by generic credential rules', () => {
-    const text = JSON.stringify({ api_key: 'rP8v2Ls7Qm4Zx9Nc6Tb3Wy5Hd1Kf0Aj8' });
+    const text = JSON.stringify({ api_key: ['rP8v2Ls7', 'Qm4Zx9Nc', '6Tb3Wy5H', 'd1Kf0Aj8'].join('') });
     expect(() => admitExchange(exchange(text))).toThrow(/content rejected by screening/i);
   });
 

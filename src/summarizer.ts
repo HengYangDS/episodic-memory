@@ -752,7 +752,7 @@ function getCodexSessionId(exchanges: ConversationExchange[], sessionId?: string
   if (!exchanges.some(exchange => exchange.harness === 'codex')) {
     return undefined;
   }
-  return sessionId || exchanges.find(exchange => exchange.sessionId)?.sessionId;
+  return sessionId || exchanges.find(exchange => exchange.harness === 'codex' && exchange.sessionId)?.sessionId;
 }
 
 /**
@@ -765,8 +765,8 @@ function getCodexSessionId(exchanges: ConversationExchange[], sessionId?: string
  *
  * Default to `undefined` so `app-server` uses the current Codex config
  * (`~/.codex/config.toml#model`). Operators can override via
- * `EPISODIC_MEMORY_CODEX_MODEL` if they need a specific model id (e.g. an
- * API-key user wanting `gpt-5.5-codex`).
+ * `EPISODIC_MEMORY_CODEX_MODEL` if they need a supported model id for their
+ * selected Codex route.
  *
  * See https://github.com/obra/episodic-memory/issues/98.
  */
@@ -790,10 +790,11 @@ export async function summarizeConversation(exchanges: ConversationExchange[], s
     }
   }
 
-  const isCodexConversation = exchanges.some(exchange => exchange.harness === 'codex');
   const codexSessionId = getCodexSessionId(exchanges, sessionId);
-  if (isCodexConversation) {
-    const isolated = !!recordPolicy || !codexSessionId;
+  if (exchanges.some(exchange => exchange.harness === 'codex')) {
+    // A sessionless or policy-filtered transcript has no source context to fork.
+    // Summarize its admitted text in a fresh, isolated Codex thread instead.
+    const isolated = recordPolicy !== null || !codexSessionId;
     const prompt = isolated
       ? `${SUMMARIZER_CONTEXT_MARKER}. Summarize only the following admitted transcript in 2-4 factual sentences inside <summary></summary>. Do not inspect files, use tools or recover any original session.\n\n${formatConversationText(exchanges)}`
       : buildCodexSummaryPrompt();
@@ -802,9 +803,9 @@ export async function summarizeConversation(exchanges: ConversationExchange[], s
   }
 
   // Cost safety (#104): everything below this point calls the metered Claude API
-  // path. If a stray global ANTHROPIC_API_KEY would be billed and the user hasn't
+  // path. Codex conversations return or fail before reaching this point.
+  // If a stray global ANTHROPIC_API_KEY would be billed and the user hasn't
   // acknowledged it, warn once and proceed (don't silently spend without notice).
-  // Placed AFTER the Codex attempt so pure-Codex users are never warned needlessly.
   if (wouldBillMeteredApi() && !meteredApiOptIn()) {
     warnMeteredApiOnce();
   }
@@ -818,7 +819,7 @@ export async function summarizeConversation(exchanges: ConversationExchange[], s
     const isClaudeSession = exchanges.some(
       e => e.harness === 'claude' || e.harness === undefined
     );
-    const claudeSessionId = !codexSessionId && isClaudeSession ? sessionId : undefined;
+    const claudeSessionId = isClaudeSession ? sessionId : undefined;
     const cwd = claudeSessionId ? exchanges.find(e => e.cwd)?.cwd : undefined;
     const conversationText = claudeSessionId
       ? '' // When resuming, no need to include conversation text - it's already in context

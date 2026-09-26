@@ -224,12 +224,10 @@ async function syncAll() {
     totals.errors.push(...result.errors);
   }
 
-  // Admission failure is a partial run, not successful synchronization.
-  // Finish migration before emitting a success claim as well.
   if (totals.errors.length === 0) await runEmbeddingMigrationPhase();
   else process.exitCode = 1;
 
-  console.log(totals.errors.length ? '\nSync finished with errors.' : '\n✅ Sync complete!');
+  console.log(totals.errors.length > 0 ? '\n⚠️  Sync finished with errors.' : '\n✅ Sync complete!');
   console.log(`  Copied: ${totals.copied}`);
   console.log(`  Skipped: ${totals.skipped}`);
   console.log(`  Indexed: ${totals.indexed}`);

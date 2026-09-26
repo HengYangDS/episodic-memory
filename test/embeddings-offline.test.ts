@@ -9,10 +9,17 @@ import { env, pipeline } from '@huggingface/transformers';
 import { initEmbeddings } from '../src/embeddings.js';
 
 describe('embedding model locality', () => {
-  it('disables remote model loading before opening the embedding pipeline', async () => {
-    await initEmbeddings();
-    expect(env.allowLocalModels).toBe(true);
-    expect(env.allowRemoteModels).toBe(false);
-    expect(pipeline).toHaveBeenCalledOnce();
+  it('defaults to offline even when no environment override is set', async () => {
+    const previous = process.env.EPISODIC_MEMORY_OFFLINE;
+    delete process.env.EPISODIC_MEMORY_OFFLINE;
+    try {
+      await initEmbeddings();
+      expect(env.allowLocalModels).toBe(true);
+      expect(env.allowRemoteModels).toBe(false);
+      expect(pipeline).toHaveBeenCalledOnce();
+    } finally {
+      if (previous === undefined) delete process.env.EPISODIC_MEMORY_OFFLINE;
+      else process.env.EPISODIC_MEMORY_OFFLINE = previous;
+    }
   });
 });

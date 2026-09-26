@@ -7,9 +7,8 @@ import { getArchiveDir, getDbPath, getExcludedProjects, findJsonlFiles, statIfEx
 import { isErroredSentinel } from './summary-sentinel.js';
 import { readRecordExclusions } from './record-admission.js';
 export async function verifyIndex() {
+    readRecordExclusions();
     const result = {
-        checkedFiles: 0,
-        parsedFiles: 0,
         missing: [],
         unindexed: [],
         orphaned: [],
@@ -26,94 +25,97 @@ export async function verifyIndex() {
     if (!fs.existsSync(archiveDir)) {
         return result;
     }
-    // Verification is read-only, including when the index does not yet exist.
+    // Verification must not create or migrate the index it is measuring.
     const dbPath = getDbPath();
     const db = fs.existsSync(dbPath) ? new Database(dbPath, { readonly: true, fileMustExist: true }) : null;
-    const indexStateRows = db?.prepare(`
-    SELECT archive_path AS archivePath, MAX(line_end) AS maxLineEnd, MAX(last_indexed) AS lastIndexed
-    FROM exchanges GROUP BY archive_path
-  `).all();
-    const indexState = new Map(indexStateRows?.map(row => [row.archivePath, row]) ?? []);
+    const indexState = db?.prepare(`
+    SELECT MAX(line_end) AS maxLineEnd, MAX(last_indexed) AS lastIndexed
+    FROM exchanges WHERE archive_path = ?
+  `);
     const projects = fs.readdirSync(archiveDir);
     const excludedProjects = getExcludedProjects();
     const excludedDirSet = new Set(excludedProjects);
-    try {
-        for (const project of projects) {
-            if (excludedProjects.includes(project)) {
-                console.log("\nSkipping excluded project: " + project);
-                continue;
-            }
-            const projectPath = path.join(archiveDir, project);
-            const stat = statIfExists(projectPath);
-            if (!stat?.isDirectory())
-                continue;
-            const files = findJsonlFiles(projectPath, excludedDirSet);
-            for (const file of files) {
-                result.checkedFiles++;
-                if (result.checkedFiles % 100 === 0) {
-                    console.log(`  Checked ${result.checkedFiles} conversations...`);
-                }
-                const conversationPath = path.join(projectPath, file);
-                foundFiles.add(conversationPath);
-                const summaryPath = conversationPath.replace('.jsonl', '-summary.txt');
-                const summaryMissing = !fs.existsSync(summaryPath)
-                    ? 'No summary file'
-                    : isErroredSentinel(fs.readFileSync(summaryPath, 'utf-8'))
-                        ? 'Previous summarization failed (error sentinel)' : null;
-                if (summaryMissing)
-                    result.missing.push({ path: conversationPath, reason: summaryMissing });
-                const state = indexState.get(conversationPath);
-                if (!state) {
-                    result.unindexed.push({ path: conversationPath });
-                    continue;
-                }
-                const fileTime = fs.statSync(conversationPath).mtimeMs;
-                // Routine verification parses only timestamp-divergent archives. This
-                // keeps high-water classification bounded on large historical corpora.
-                if (state.lastIndexed !== null && fileTime <= state.lastIndexed)
-                    continue;
-                result.parsedFiles++;
-                try {
-                    const exchanges = await parseConversation(conversationPath, project, conversationPath);
-                    if (exchanges.some(exchange => exchange.lineEnd > state.maxLineEnd)) {
-                        result.outdated.push({ path: conversationPath, fileTime, dbTime: state.lastIndexed ?? 0 });
-                    }
-                    else if (state.lastIndexed !== null && fileTime > state.lastIndexed) {
-                        result.archiveRefreshes.push({ path: conversationPath, fileTime, dbTime: state.lastIndexed });
-                    }
-                }
-                catch (error) {
-                    const message = error instanceof Error ? error.message : String(error);
-                    if (message === 'Record content rejected by screening' || message === 'Record screening byte limit exceeded') {
-                        result.screeningRejected.push({ path: conversationPath });
-                    }
-                    else if (message === 'Record screening unavailable') {
-                        result.screeningUnavailable.push({ path: conversationPath });
-                    }
-                    else {
-                        result.corrupted.push({ path: conversationPath, error: message });
-                    }
-                }
-            }
+    let totalChecked = 0;
+    for (const project of projects) {
+        if (excludedProjects.includes(project)) {
+            console.log("\nSkipping excluded project: " + project);
+            continue;
         }
-        console.log(`Checked ${result.checkedFiles} conversations; parsed ${result.parsedFiles} changed archives.`);
-        // Rows may refer directly to active or archived source sessions. They are
-        // orphaned only when their source is absent, not when it is outside the archive.
-        for (const exchange of db ? getAllExchanges(db) : []) {
-            if (!foundFiles.has(exchange.archivePath) && !statIfExists(exchange.archivePath)?.isFile()) {
-                result.orphaned.push({
-                    uuid: exchange.id,
-                    path: exchange.archivePath
-                });
+        const projectPath = path.join(archiveDir, project);
+        const stat = statIfExists(projectPath);
+        if (!stat?.isDirectory())
+            continue;
+        const files = findJsonlFiles(projectPath, excludedDirSet);
+        for (const file of files) {
+            totalChecked++;
+            if (totalChecked % 100 === 0) {
+                console.log(`  Checked ${totalChecked} conversations...`);
+            }
+            const conversationPath = path.join(projectPath, file);
+            foundFiles.add(conversationPath);
+            const summaryPath = conversationPath.replace('.jsonl', '-summary.txt');
+            // Check for missing or errored summary. An error sentinel (#96) means a
+            // previous summarization failed — verify treats it as "missing" so repair
+            // re-attempts it rather than reporting the conversation as healthy.
+            if (!fs.existsSync(summaryPath)) {
+                result.missing.push({ path: conversationPath, reason: 'No summary file' });
+            }
+            else if (isErroredSentinel(fs.readFileSync(summaryPath, 'utf-8'))) {
+                result.missing.push({ path: conversationPath, reason: 'Previous summarization failed (error sentinel)' });
+            }
+            const state = indexState?.get(conversationPath);
+            const maxLineEnd = state?.maxLineEnd ?? null;
+            if (maxLineEnd === null)
+                result.unindexed.push({ path: conversationPath });
+            // Parse independently of summary state and mtime. Only exchanges past
+            // the indexed high-water mark are a real index delta.
+            try {
+                const exchanges = await parseConversation(conversationPath, project, conversationPath);
+                if (maxLineEnd !== null) {
+                    const fileTime = fs.statSync(conversationPath).mtimeMs;
+                    const dbTime = state?.lastIndexed ?? 0;
+                    if (exchanges.some(exchange => exchange.lineEnd > maxLineEnd)) {
+                        result.outdated.push({ path: conversationPath, fileTime, dbTime });
+                    }
+                    else if (state?.lastIndexed != null && fileTime > state.lastIndexed) {
+                        result.archiveRefreshes.push({ path: conversationPath, fileTime, dbTime });
+                    }
+                }
+            }
+            catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+                if (message === 'Record content rejected by screening' ||
+                    message === 'Record screening byte limit exceeded' ||
+                    message === 'Record screening nesting limit exceeded') {
+                    result.screeningRejected.push({ path: conversationPath });
+                }
+                else if (message === 'Record screening unavailable') {
+                    result.screeningUnavailable.push({ path: conversationPath });
+                }
+                else {
+                    result.corrupted.push({ path: conversationPath, error: message });
+                }
             }
         }
     }
-    finally {
-        db?.close();
+    console.log(`Verified ${totalChecked} conversations.`);
+    // Check for orphaned database entries
+    const dbExchanges = db ? getAllExchanges(db) : [];
+    db?.close();
+    for (const exchange of dbExchanges) {
+        if (!foundFiles.has(exchange.archivePath) && !statIfExists(exchange.archivePath)?.isFile()) {
+            result.orphaned.push({
+                uuid: exchange.id,
+                path: exchange.archivePath
+            });
+        }
     }
     return result;
 }
 export async function repairIndex(issues) {
+    if (issues.screeningRejected.length + issues.screeningUnavailable.length > 0) {
+        throw new Error('Resolve record screening failures before repair');
+    }
     readRecordExclusions();
     console.log('Repairing index...');
     // To avoid circular dependencies, we import the indexer functions dynamically

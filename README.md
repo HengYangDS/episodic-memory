@@ -229,7 +229,7 @@ In Codex and opencode, the skill guides the agent to use the episodic-memory MCP
 
 ## API Configuration
 
-By default, episodic-memory uses your Claude Code authentication for Claude Code summarization. Codex-indexed sessions with a session ID are summarized through `codex app-server` by creating an ephemeral `thread/fork`, so the summary can use Codex session context and reasoning summaries without appending to the original rollout.
+By default, episodic-memory uses your Claude Code authentication for Claude Code summarization. Codex-indexed sessions with a session ID are summarized through `codex app-server` by creating an ephemeral `thread/fork`, so the summary can use Codex session context and reasoning summaries without appending to the original rollout. A Codex transcript without a session ID is summarized from its admitted text in an isolated ephemeral `thread/start`; it is never sent to Claude.
 
 To route summarization through a custom Anthropic-compatible endpoint or override the model:
 
@@ -237,7 +237,7 @@ To route summarization through a custom Anthropic-compatible endpoint or overrid
 # Override model (default: haiku)
 export EPISODIC_MEMORY_API_MODEL=opus
 
-# Override fallback model on error (default: sonnet)
+# Override the Claude fallback model on error (default: sonnet; not used for Codex)
 export EPISODIC_MEMORY_API_MODEL_FALLBACK=sonnet
 
 # Route through custom endpoint
@@ -309,18 +309,33 @@ These pass through unchanged to episodic-memory's summarizer subprocess. Because
 
 These settings only affect episodic-memory's summarization calls, not your interactive Claude Code or Codex sessions.
 
-Codex summarization requires `codex-cli 0.130.0` or newer. If Codex app-server summarization is unavailable, sync logs the reason and falls back to transcript-text summarization.
+Codex summarization requires `codex-cli 0.130.0` or newer; isolated transcript-only summaries require `0.154.0` or newer. If Codex app-server summarization is unavailable, sync records a retryable summary failure rather than switching providers. Indexing exchanges remains independent of the summary.
 
 ### What's Affected
 
 | Component | Uses custom config? |
 |-----------|---------------------|
 | Summarization | Yes (up to 10 calls/sync) |
-| Embeddings | No (local Transformers.js) |
+| Embeddings | Optional cache and offline settings (local Transformers.js) |
 | Search | No (local SQLite) |
 | MCP tools | No |
 
 Summaries are display-only: they decorate search results and are never embedded or searched, so `EPISODIC_MEMORY_SKIP_SUMMARIES=1` costs you that line of context and nothing else.
+
+### Embedding model cache and offline mode
+
+Embedding computation is local. This personal build does not download a model
+unless `EPISODIC_MEMORY_OFFLINE=0` is set explicitly. Model files are cached
+under the durable Episodic Memory configuration directory in `models/`, outside
+npm-owned `node_modules`. An upgrade or dependency reinstall does not discard
+them. Set
+`EPISODIC_MEMORY_MODEL_CACHE_DIR` to an absolute path to use a different or
+pre-seeded cache.
+
+Seed the model cache before indexing or semantic search; a missing model fails
+with an explicit cache/offline error rather than silently fetching it. The
+upstream release defaults to downloading on first use; the offline default is
+specific to this personal build.
 
 ## Commands
 
@@ -387,9 +402,14 @@ This test uses your normal Claude Code auth and writes small test transcripts to
 Manual indexing tools for bulk operations and maintenance. See `episodic-memory index --help` for full options.
 
 Common operations:
-- `--cleanup` - Index all unprocessed conversations
-- `--verify` - Check index health
-- `--repair` - Fix detected issues
+- `--cleanup` - Index unprocessed exchanges; summaries may call an AI provider unless disabled
+- `--verify` - Distinguish missing summaries, unindexed archives, appended exchanges, and archive mtime refreshes
+- `--repair` - Re-embed and regenerate summaries for repair candidates; review the scope and provider cost first
+
+An archive mtime refresh without new exchanges is reported separately and is
+not an outdated-index repair target. An unindexed archive is reported, but
+that status alone does not select it for `--repair`; a separate overlapping
+repair category may still cause it to be processed.
 
 ### `episodic-memory search`
 
@@ -426,20 +446,20 @@ open output.html
 
 1. **Sync** - Copies conversation files from Claude Code and Codex transcript directories to archive; exports opencode sessions from SQLite into generated JSONL transcripts
 2. **Parse** - Extracts user-agent exchanges from Claude Code JSONL, Codex rollout JSONL, or opencode transcript JSONL
-3. **Embed** - Generates vector embeddings using Transformers.js (local, offline)
+3. **Embed** - Generates vectors locally with Transformers.js after the model is available
 4. **Index** - Stores in SQLite with sqlite-vec for fast similarity search
 5. **Search** - Semantic search using vector similarity or exact text matching
 
 ## Excluding Conversations
 
-Conversations containing this marker anywhere in their content are excluded before new archive copying, parsing, and indexing:
+Conversations with this marker in a decoded user instruction are excluded before new archive copying, parsing, and indexing:
 
 ```
 <INSTRUCTIONS-TO-EPISODIC-MEMORY>DO NOT INDEX THIS CHAT</INSTRUCTIONS-TO-EPISODIC-MEMORY>
 ```
 
 **Automatic exclusions:**
-- Conversations where Claude generates summaries (marker in system prompt)
+- Summarizer-generated conversations carrying the marker in their prompt
 - Meta-conversations about conversation processing
 
 **Use cases:**
@@ -448,7 +468,7 @@ Conversations containing this marker anywhere in their content are excluded befo
 - Test or experimental sessions
 - Any conversation you don't want searchable
 
-The marker can appear in any message (user or assistant). It prevents new derived copies and indexing; it does not delete an existing archive or index entry.
+The marker in user instructions prevents new derived copies and indexing; an assistant quotation or tool result does not opt out the conversation. It does not delete an existing archive or index entry.
 
 ### Persistent record exclusions
 
@@ -502,18 +522,14 @@ Summarization with a record policy uses admitted transcript text, never a resume
 source session. Codex retains its selected provider through an ephemeral fresh
 context and fails rather than silently falling back to another provider. Claude
 receives the admitted text without session resume. Policy-enabled Codex summaries
-require Codex 0.154.0 or newer. The subprocess disables host tools, plugins, hooks,
-apps, automatic instructions and bundled skills before startup, then disables
-each inherited MCP and skill entry. It receives no execution environments or
-capability roots and uses a temporary empty working directory. The native skills
-namespace may remain visible but has no accessible packages. A native synthetic
-Responses peer verified empty skill discovery and rejected skill, shell and MCP
-reads; no real model or production credential was used. Provider error payloads
-are suppressed, and the temporary directory is removed after process termination.
+require Codex 0.154.0 or newer. The isolated summary path disables inherited
+tools, plugins, hooks, and skills, and refuses to proceed if the configured
+MCP or skill boundary cannot be established. It uses a temporary empty working
+directory; provider error payloads are suppressed and the directory is removed
+after process termination.
 
-The shipped dependency lock is authoritative for bootstrap: the native install
-runner uses `npm ci` when the lock exists. Native install and removal were
-qualified in an isolated home, including clean SQLite/vector/Transformers loads.
+The shipped dependency lock is authoritative for this personal build: the
+native install runner uses `npm ci` when the lock exists.
 
 ### Optional local secret screening
 
@@ -531,8 +547,7 @@ content before derived archive writes, reads, summaries and database insertion:
 ```
 
 Keep the existing `version`, `exchanges` and `tool_calls` fields. Install Gitleaks
-through the host's managed package source (Homebrew first on this workstation),
-resolve its executable symlink and verify its provenance before pinning its
+through a trusted package source, resolve its executable symlink and verify its provenance before pinning its
 SHA-256. On migration or upgrade, explicitly replace the host-local path and
 digest after verifying the new executable. The scanner must be a regular,
 executable file owned by the current user or root and not group/world-writable.
@@ -544,6 +559,9 @@ retaining key/value assignment context; separate exchange messages are screened
 separately. A finding rejects the operation rather than silently dropping a new
 message and breaking conversation pairing. Missing/changed executables, byte or
 nesting limits, timeouts and malformed or contradictory reports fail closed.
+Verification reports scanner rejections and scanner unavailability separately
+from transcript corruption, even when a summary is missing. A broad repair
+refuses to start while either screening failure remains.
 No findings, input, scanner diagnostics or secret fingerprints appear in errors.
 The scanner receives stdin in a private empty working directory with no inherited
 environment/configuration and with inline allow comments disabled. Its temporary
@@ -648,6 +666,12 @@ npm test
 # Build
 npm run build
 ```
+
+`npm test` prepares the embedding model once in the ignored
+`tmp/test-model-cache` directory, then runs test workers without remote model
+downloads. A fresh test run may download the public model; setting
+`EPISODIC_MEMORY_OFFLINE=1` requires a pre-seeded test cache instead. This does
+not change the production model cache or summarization routes.
 
 ## License
 
