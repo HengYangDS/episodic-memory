@@ -37929,7 +37929,7 @@ function formatCursorConversationAsMarkdown(lines) {
 }
 
 // src/version.ts
-var VERSION = "1.6.0+codex.20260926132657";
+var VERSION = "1.6.0+codex.20260926135432";
 
 // src/mcp-server.ts
 import fs5 from "fs";

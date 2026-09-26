@@ -73,6 +73,16 @@ cmd_check() {
     versions+=("$ver")
   done < <(declared_files)
 
+  local lockfile="$REPO_ROOT/package-lock.json"
+  if [[ -f "$lockfile" ]]; then
+    local lock_version root_version
+    lock_version=$(jq -r '.version' "$lockfile")
+    root_version=$(jq -r '.packages[""].version' "$lockfile")
+    printf "  %-45s  %s\n" "package-lock.json (version)" "$lock_version"
+    printf "  %-45s  %s\n" "package-lock.json (packages[\"\"].version)" "$root_version"
+    versions+=("$lock_version" "$root_version")
+  fi
+
   echo ""
 
   # Check if all versions match
@@ -134,7 +144,7 @@ cmd_audit() {
     local match_file
     match_file=$(echo "$match" | cut -d: -f1)
     # Make path relative to repo root
-    local rel_path="${match_file#$REPO_ROOT/}"
+    local rel_path="${match_file#"$REPO_ROOT"/}"
 
     # Check if this file is in the declared list
     local is_declared=0
@@ -186,6 +196,17 @@ cmd_bump() {
     write_json_field "$fullpath" "$field" "$new_version"
     printf "  %-45s  %s -> %s\n" "$path ($field)" "$old_ver" "$new_version"
   done < <(declared_files)
+
+  local lockfile="$REPO_ROOT/package-lock.json"
+  if [[ -f "$lockfile" ]]; then
+    jq -e '.packages[""].version | strings' "$lockfile" > /dev/null
+    local old_lock_version tmp
+    old_lock_version=$(jq -r '.version' "$lockfile")
+    tmp="${lockfile}.tmp"
+    jq --arg version "$new_version" '.version = $version | .packages[""].version = $version' "$lockfile" > "$tmp"
+    mv "$tmp" "$lockfile"
+    printf "  %-45s  %s -> %s\n" "package-lock.json (root versions)" "$old_lock_version" "$new_version"
+  fi
 
   echo ""
   echo "Done. Running audit to check for missed files..."
