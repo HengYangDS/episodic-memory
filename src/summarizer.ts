@@ -711,6 +711,7 @@ export async function runCodexCommand(command: CodexSummarizerCommand): Promise<
         const fork = await send(method, {
           ...(command.sessionId ? { threadId: command.sessionId } : {}),
           ephemeral: true,
+          excludeTurns: true,
           sandbox: 'read-only',
           approvalPolicy: 'never',
           ...(command.model ? { model: command.model } : {}),
