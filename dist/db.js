@@ -167,6 +167,9 @@ export function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_session_id ON exchanges(session_id)
   `);
     db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_archive_line_start ON exchanges(archive_path, line_start)
+  `);
+    db.exec(`
     CREATE INDEX IF NOT EXISTS idx_project ON exchanges(project)
   `);
     db.exec(`
@@ -192,33 +195,43 @@ export function insertExchange(db, exchange, embedding, toolNames) {
         return;
     exchange = admitted;
     const now = Date.now();
-    const stmt = db.prepare(`
-    INSERT OR REPLACE INTO exchanges
-    (id, project, timestamp, user_message, assistant_message, archive_path, line_start, line_end, last_indexed,
-     parent_uuid, is_sidechain, harness, session_id, cwd, git_branch, claude_version, agent_version, model, model_provider,
-     thinking_level, thinking_disabled, thinking_triggers, embedding_version)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-    stmt.run(exchange.id, exchange.project, exchange.timestamp, exchange.userMessage, exchange.assistantMessage, exchange.archivePath, exchange.lineStart, exchange.lineEnd, now, exchange.parentUuid || null, exchange.isSidechain ? 1 : 0, exchange.harness || 'claude', exchange.sessionId || null, exchange.cwd || null, exchange.gitBranch || null, exchange.claudeVersion || null, exchange.agentVersion || exchange.claudeVersion || null, exchange.model || null, exchange.modelProvider || null, exchange.thinkingLevel || null, exchange.thinkingDisabled ? 1 : 0, exchange.thinkingTriggers || null, EMBEDDING_VERSION);
-    // Insert into vector table (delete first since virtual tables don't support REPLACE)
-    const delStmt = db.prepare(`DELETE FROM vec_exchanges WHERE id = ?`);
-    delStmt.run(exchange.id);
-    const vecStmt = db.prepare(`
-    INSERT INTO vec_exchanges (id, embedding)
-    VALUES (?, ?)
-  `);
-    vecStmt.run(exchange.id, Buffer.from(new Float32Array(embedding).buffer));
-    // Insert tool calls if present
-    if (exchange.toolCalls && exchange.toolCalls.length > 0) {
-        const toolStmt = db.prepare(`
-      INSERT OR REPLACE INTO tool_calls
-      (id, exchange_id, tool_name, tool_input, tool_result, is_error, timestamp)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+    const save = db.transaction(() => {
+        const stmt = db.prepare(`
+      INSERT OR REPLACE INTO exchanges
+      (id, project, timestamp, user_message, assistant_message, archive_path, line_start, line_end, last_indexed,
+       parent_uuid, is_sidechain, harness, session_id, cwd, git_branch, claude_version, agent_version, model, model_provider,
+       thinking_level, thinking_disabled, thinking_triggers, embedding_version)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
-        for (const toolCall of exchange.toolCalls) {
-            toolStmt.run(toolCall.id, toolCall.exchangeId, toolCall.toolName, toolCall.toolInput ? JSON.stringify(toolCall.toolInput) : null, toolCall.toolResult || null, toolCall.isError ? 1 : 0, toolCall.timestamp);
+        stmt.run(exchange.id, exchange.project, exchange.timestamp, exchange.userMessage, exchange.assistantMessage, exchange.archivePath, exchange.lineStart, exchange.lineEnd, now, exchange.parentUuid || null, exchange.isSidechain ? 1 : 0, exchange.harness || 'claude', exchange.sessionId || null, exchange.cwd || null, exchange.gitBranch || null, exchange.claudeVersion || null, exchange.agentVersion || exchange.claudeVersion || null, exchange.model || null, exchange.modelProvider || null, exchange.thinkingLevel || null, exchange.thinkingDisabled ? 1 : 0, exchange.thinkingTriggers || null, EMBEDDING_VERSION);
+        // Virtual tables do not support REPLACE.
+        db.prepare('DELETE FROM vec_exchanges WHERE id = ?').run(exchange.id);
+        db.prepare('INSERT INTO vec_exchanges (id, embedding) VALUES (?, ?)')
+            .run(exchange.id, Buffer.from(new Float32Array(embedding).buffer));
+        if (exchange.toolCalls && exchange.toolCalls.length > 0) {
+            const toolStmt = db.prepare(`
+        INSERT OR REPLACE INTO tool_calls
+        (id, exchange_id, tool_name, tool_input, tool_result, is_error, timestamp)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `);
+            for (const toolCall of exchange.toolCalls) {
+                toolStmt.run(toolCall.id, toolCall.exchangeId, toolCall.toolName, toolCall.toolInput ? JSON.stringify(toolCall.toolInput) : null, toolCall.toolResult || null, toolCall.isError ? 1 : 0, toolCall.timestamp);
+            }
         }
-    }
+        const superseded = db.prepare(`
+      SELECT id FROM exchanges
+      WHERE archive_path = ? AND line_start = ? AND id <> ?
+    `).all(exchange.archivePath, exchange.lineStart, exchange.id);
+        for (const old of superseded)
+            deleteExchange(db, old.id);
+    });
+    save();
+}
+/** Select new or extended exchanges without re-embedding stable indexed spans. */
+export function getExchangesNeedingIndex(db, archivePath, exchanges) {
+    const indexed = new Set(db.prepare('SELECT line_start AS lineStart, line_end AS lineEnd FROM exchanges WHERE archive_path = ?')
+        .all(archivePath).map(row => `${row.lineStart}:${row.lineEnd}`));
+    return exchanges.filter(exchange => !indexed.has(`${exchange.lineStart}:${exchange.lineEnd}`));
 }
 export function getAllExchanges(db) {
     const stmt = db.prepare(`SELECT id, archive_path as archivePath FROM exchanges`);

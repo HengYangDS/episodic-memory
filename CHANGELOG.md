@@ -1,3 +1,7 @@
+## Local repair — 2026-09-30
+
+- Reconcile continued exchanges by their source line span across manual indexing, background sync, and verification. An assistant continuation now replaces the superseded index row and vector atomically instead of being skipped or duplicated. The rule applies to every supported conversation source, without a harness-specific exception or a model call.
+
 ## Local integration — 2026-09-26
 
 - Integrate upstream PRs #176–#180 for high-water indexing, verifier classification, Codex-only summaries, durable model caching, and record admission.

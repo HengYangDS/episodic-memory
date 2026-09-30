@@ -450,6 +450,16 @@ open output.html
 4. **Index** - Stores in SQLite with sqlite-vec for fast similarity search
 5. **Search** - Semantic search using vector similarity or exact text matching
 
+The originating agent owns its transcript and session lifecycle; this index is a
+rebuildable recall view, not a shared session or durable-instruction authority.
+Any MCP-compatible agent can consume search and read without taking ownership
+of another agent's sessions. To add a transcript source, implement and test its
+locator, parser, exclusion boundary, and lifecycle rules explicitly; do not
+scan an arbitrary home directory or infer that one agent's archive or
+completion semantics apply to another. Indexing reconciles exchanges by their
+source line spans, so later assistant output updates an existing exchange
+without a harness-specific exception.
+
 ## Excluding Conversations
 
 Conversations with this marker in a decoded user instruction are excluded before new archive copying, parsing, and indexing:

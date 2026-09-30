@@ -113,4 +113,34 @@ describe('insertExchange with last_indexed', () => {
 
     db.close();
   });
+
+  it('replaces a superseded line span and its vector without leaving duplicates', () => {
+    const db = initDatabase();
+    const first: ConversationExchange = {
+      id: 'span-1', project: 'test-project', timestamp: '2024-01-01T00:00:00Z',
+      userMessage: 'Question', assistantMessage: 'Initial answer',
+      archivePath: '/test/continued.jsonl', lineStart: 1, lineEnd: 2,
+    };
+    insertExchange(db, first, new Array(384).fill(0.1));
+    insertExchange(db, { ...first, id: 'span-2', assistantMessage: 'Continued answer', lineEnd: 3 }, new Array(384).fill(0.2));
+
+    expect(db.prepare('SELECT id FROM exchanges').all()).toEqual([{ id: 'span-2' }]);
+    expect(db.prepare('SELECT COUNT(*) AS count FROM vec_exchanges').get()).toEqual({ count: 1 });
+    db.close();
+  });
+
+  it('keeps the previous indexed span when a replacement vector fails', () => {
+    const db = initDatabase();
+    const first: ConversationExchange = {
+      id: 'span-1', project: 'test-project', timestamp: '2024-01-01T00:00:00Z',
+      userMessage: 'Question', assistantMessage: 'Initial answer',
+      archivePath: '/test/continued.jsonl', lineStart: 1, lineEnd: 2,
+    };
+    insertExchange(db, first, new Array(384).fill(0.1));
+
+    expect(() => insertExchange(db, { ...first, id: 'span-2', lineEnd: 3 }, [0.2])).toThrow();
+    expect(db.prepare('SELECT id FROM exchanges').all()).toEqual([{ id: 'span-1' }]);
+    expect(db.prepare('SELECT COUNT(*) AS count FROM vec_exchanges').get()).toEqual({ count: 1 });
+    db.close();
+  });
 });

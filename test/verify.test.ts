@@ -6,6 +6,7 @@ import path from 'path';
 import os from 'os';
 import { initDatabase, insertExchange } from '../src/db.js';
 import { ConversationExchange } from '../src/types.js';
+import { parseConversation } from '../src/parser.js';
 import { summarizeConversation } from '../src/summarizer.js';
 
 vi.mock('../src/embeddings.js', () => ({
@@ -247,6 +248,35 @@ describe('verifyIndex', () => {
     const result = await verifyIndex();
     expect(result.outdated).toEqual([]);
     expect(result.archiveRefreshes.map(item => item.path)).toEqual([conversationPath]);
+  });
+
+  it('detects a changed earlier exchange even when the final high-water line is unchanged', async () => {
+    const projectArchive = path.join(archiveDir, 'test-project');
+    fs.mkdirSync(projectArchive, { recursive: true });
+    const conversationPath = path.join(projectArchive, 'continued-earlier.jsonl');
+    const lines = [
+      JSON.stringify({ type: 'user', message: { role: 'user', content: 'First question' }, timestamp: '2024-01-01T00:00:00Z' }),
+      JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: 'First answer' }, timestamp: '2024-01-01T00:00:01Z' }),
+      JSON.stringify({ type: 'ai-title', title: 'Ignored metadata' }),
+      JSON.stringify({ type: 'user', message: { role: 'user', content: 'Second question' }, timestamp: '2024-01-01T00:00:02Z' }),
+      JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: 'Second answer' }, timestamp: '2024-01-01T00:00:03Z' }),
+    ];
+    fs.writeFileSync(conversationPath, lines.join('\n') + '\n');
+    fs.writeFileSync(conversationPath.replace('.jsonl', '-summary.txt'), 'Existing summary');
+    const db = initDatabase();
+    for (const exchange of await parseConversation(conversationPath, 'test-project', conversationPath)) {
+      insertExchange(db, exchange, new Array(384).fill(0.1));
+    }
+    db.close();
+    expect((await verifyIndex()).outdated).toEqual([]);
+
+    lines[2] = JSON.stringify({
+      type: 'assistant', message: { role: 'assistant', content: 'Continued first answer' }, timestamp: '2024-01-01T00:00:01Z',
+    });
+    fs.writeFileSync(conversationPath, lines.join('\n') + '\n');
+
+    const result = await verifyIndex();
+    expect(result.outdated.map(item => item.path)).toEqual([conversationPath]);
   });
 
   it('reports a missing summary and an appended exchange independently', async () => {

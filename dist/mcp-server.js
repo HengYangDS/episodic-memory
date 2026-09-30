@@ -35657,6 +35657,9 @@ function initDatabase() {
     CREATE INDEX IF NOT EXISTS idx_session_id ON exchanges(session_id)
   `);
   db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_archive_line_start ON exchanges(archive_path, line_start)
+  `);
+  db.exec(`
     CREATE INDEX IF NOT EXISTS idx_project ON exchanges(project)
   `);
   db.exec(`

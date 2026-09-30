@@ -136,6 +136,31 @@ describe('sync: high-water mark (#152 Part A)', () => {
     // Only the appended exchange should be re-embedded — NOT all 3.
     expect(newCalls).toBe(1);
   });
+
+  it('replaces a continued exchange instead of leaving a stale indexed answer', async () => {
+    const sessionId = '019aff97-5651-71e0-80ec-b4f2c51095c4';
+    mkdirSync(join(sourceDir, 'project-a'), { recursive: true });
+    const srcFile = join(sourceDir, 'project-a', `${sessionId}.jsonl`);
+    writeFileSync(srcFile, exchangeLines(1, sessionId), 'utf-8');
+
+    await syncConversations(sourceDir, destDir, { skipSummaries: true });
+    expect(embedSpy).toHaveBeenCalledTimes(1);
+
+    appendFileSync(srcFile, assistantLine(1, sessionId, 'continued answer') + '\n');
+    const future = new Date(Date.now() + 5000);
+    utimesSync(srcFile, future, future);
+    await syncConversations(sourceDir, destDir, { skipSummaries: true });
+
+    const db = new Database(dbPath);
+    sqliteVec.load(db);
+    const rows = db.prepare('SELECT line_start AS lineStart, line_end AS lineEnd FROM exchanges').all() as
+      Array<{ lineStart: number; lineEnd: number }>;
+    const vectors = (db.prepare('SELECT COUNT(*) AS count FROM vec_exchanges').get() as { count: number }).count;
+    db.close();
+    expect(embedSpy).toHaveBeenCalledTimes(2);
+    expect(rows).toEqual([{ lineStart: 1, lineEnd: 3 }]);
+    expect(vectors).toBe(1);
+  });
 });
 
 describe('shouldSkipConversation: fail-closed streaming marker scan (#152 Part B)', () => {

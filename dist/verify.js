@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import Database from 'better-sqlite3';
 import { parseConversation } from './parser.js';
-import { getAllExchanges } from './db.js';
+import { getAllExchanges, getExchangesNeedingIndex } from './db.js';
 import { getArchiveDir, getDbPath, getExcludedProjects, findJsonlFiles, statIfExists } from './paths.js';
 import { isErroredSentinel } from './summary-sentinel.js';
 import { readRecordExclusions } from './record-admission.js';
@@ -65,16 +65,18 @@ export async function verifyIndex() {
             }
             const state = indexState?.get(conversationPath);
             const maxLineEnd = state?.maxLineEnd ?? null;
-            if (maxLineEnd === null)
-                result.unindexed.push({ path: conversationPath });
-            // Parse independently of summary state and mtime. Only exchanges past
-            // the indexed high-water mark are a real index delta.
+            // Parse independently of summary state and mtime. A previously indexed
+            // exchange can extend without starting past the file's high-water line.
             try {
                 const exchanges = await parseConversation(conversationPath, project, conversationPath);
-                if (maxLineEnd !== null) {
+                if (maxLineEnd === null) {
+                    if (exchanges.length > 0)
+                        result.unindexed.push({ path: conversationPath });
+                }
+                else {
                     const fileTime = fs.statSync(conversationPath).mtimeMs;
                     const dbTime = state?.lastIndexed ?? 0;
-                    if (exchanges.some(exchange => exchange.lineEnd > maxLineEnd)) {
+                    if (getExchangesNeedingIndex(db, conversationPath, exchanges).length > 0) {
                         result.outdated.push({ path: conversationPath, fileTime, dbTime });
                     }
                     else if (state?.lastIndexed != null && fileTime > state.lastIndexed) {

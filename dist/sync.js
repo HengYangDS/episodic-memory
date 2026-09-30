@@ -183,7 +183,7 @@ export async function syncConversations(sourceDir, destDir, options = {}) {
                 'indexing this run (copying and summaries still run). See the error above.');
         }
         if (embeddings) {
-            const { initDatabase, insertExchange } = await import('./db.js');
+            const { getExchangesNeedingIndex, initDatabase, insertExchange } = await import('./db.js');
             const { generateExchangeEmbedding } = embeddings;
             const db = initDatabase();
             const maxMessageBytes = getMaxMessageBytes();
@@ -194,17 +194,9 @@ export async function syncConversations(sourceDir, destDir, options = {}) {
                     if (shouldSkipConversation(file)) {
                         continue; // Skip indexing but file is already copied
                     }
-                    // High-water mark: index exchanges past the last line we've already
-                    // covered. Transcript JSONLs are append-only, so MAX(line_end) tells
-                    // us where to resume — without this, a grown transcript re-embeds
-                    // every exchange on every sync (#152). Ported from indexer.ts.
-                    const hw = db.prepare('SELECT COALESCE(MAX(line_end), 0) as maxLine FROM exchanges WHERE archive_path = ?').get(file);
-                    const maxIndexedLine = hw.maxLine;
                     const project = path.basename(path.dirname(file));
                     const exchanges = await parseConversation(file, project, file);
-                    const newExchanges = maxIndexedLine > 0
-                        ? exchanges.filter(e => e.lineStart > maxIndexedLine)
-                        : exchanges;
+                    const newExchanges = getExchangesNeedingIndex(db, file, exchanges);
                     for (const exchange of newExchanges) {
                         // Skip oversize single messages BEFORE embedding — a foreign
                         // summarizer's pasted transcript is noise, and embedding it is the

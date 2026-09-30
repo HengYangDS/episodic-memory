@@ -3,6 +3,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, appendFileSync, readFileSync, rm
 import { join } from 'path';
 import { tmpdir } from 'os';
 import Database from 'better-sqlite3';
+import * as sqliteVec from 'sqlite-vec';
 import { indexSession, indexUnprocessed } from '../src/indexer.js';
 import { getArchiveDir } from '../src/paths.js';
 import { suppressConsole } from './test-utils.js';
@@ -126,6 +127,7 @@ describe('indexer: incremental indexing', () => {
     await indexSession('session-1', 1, true);
 
     const after = new Database(dbPath);
+    sqliteVec.load(after);
     const rows = after.prepare('SELECT line_start AS lineStart, last_indexed AS lastIndexed FROM exchanges ORDER BY line_start')
       .all() as Array<{ lineStart: number; lastIndexed: number }>;
     after.close();
@@ -134,5 +136,61 @@ describe('indexer: incremental indexing', () => {
     expect(rows[1].lineStart).toBe(3);
     expect(rows[1].lastIndexed).toBeGreaterThan(123);
     expect(readFileSync(archivePath, 'utf-8')).toBe(readFileSync(transcriptPath, 'utf-8'));
+  });
+
+  it('reconciles an assistant continuation in an already indexed exchange', async () => {
+    const projectDir = join(projectsDir, 'project-a');
+    mkdirSync(projectDir, { recursive: true });
+    const transcriptPath = join(projectDir, 'session-continued.jsonl');
+    writeFileSync(transcriptPath, makeExchangeLines(1, 'session-continued'), 'utf-8');
+
+    await indexSession('session-continued', 1, true);
+    const before = new Database(dbPath);
+    const oldId = (before.prepare('SELECT id FROM exchanges').get() as { id: string }).id;
+    before.close();
+
+    appendFileSync(transcriptPath, JSON.stringify({
+      type: 'assistant',
+      message: { role: 'assistant', content: [{ type: 'text', text: 'A later completion of the same answer' }] },
+      timestamp: '2026-01-02T00:00:01Z',
+    }) + '\n');
+    await indexSession('session-continued', 1, true);
+
+    const after = new Database(dbPath);
+    sqliteVec.load(after);
+    const rows = after.prepare('SELECT id, line_start AS lineStart, line_end AS lineEnd, assistant_message AS answer FROM exchanges').all() as
+      Array<{ id: string; lineStart: number; lineEnd: number; answer: string }>;
+    const vectors = (after.prepare('SELECT COUNT(*) AS count FROM vec_exchanges').get() as { count: number }).count;
+    after.close();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].id).not.toBe(oldId);
+    expect(rows[0].lineStart).toBe(1);
+    expect(rows[0].lineEnd).toBe(3);
+    expect(rows[0].answer).toContain('A later completion');
+    expect(vectors).toBe(1);
+  });
+
+  it('reconciles an assistant continuation through cleanup without re-embedding unchanged exchanges', async () => {
+    const projectDir = join(projectsDir, 'project-a');
+    mkdirSync(projectDir, { recursive: true });
+    const transcriptPath = join(projectDir, 'session-cleanup.jsonl');
+    writeFileSync(transcriptPath, makeExchangeLines(1, 'session-cleanup') + makeExchangeLines(2, 'session-cleanup'), 'utf-8');
+    await indexUnprocessed(1, true);
+
+    appendFileSync(transcriptPath, JSON.stringify({
+      type: 'assistant',
+      message: { role: 'assistant', content: [{ type: 'text', text: 'Continued second answer' }] },
+      timestamp: '2026-01-03T00:00:01Z',
+    }) + '\n');
+    await indexUnprocessed(1, true);
+
+    const db = new Database(dbPath);
+    sqliteVec.load(db);
+    const rows = db.prepare('SELECT line_start AS lineStart, line_end AS lineEnd FROM exchanges ORDER BY line_start').all() as
+      Array<{ lineStart: number; lineEnd: number }>;
+    const vectors = (db.prepare('SELECT COUNT(*) AS count FROM vec_exchanges').get() as { count: number }).count;
+    db.close();
+    expect(rows).toEqual([{ lineStart: 1, lineEnd: 2 }, { lineStart: 3, lineEnd: 5 }]);
+    expect(vectors).toBe(2);
   });
 });

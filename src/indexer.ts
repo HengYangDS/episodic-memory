@@ -2,7 +2,7 @@ import fs from 'fs';
 import { archiveAdmittedConversation, readRecordExclusions } from './record-admission.js';
 import path from 'path';
 import os from 'os';
-import { initDatabase, insertExchange } from './db.js';
+import { getExchangesNeedingIndex, initDatabase, insertExchange } from './db.js';
 import { parseConversation } from './parser.js';
 import { initEmbeddings, generateExchangeEmbedding } from './embeddings.js';
 import { summarizeConversation } from './summarizer.js';
@@ -242,10 +242,6 @@ export async function indexSession(sessionId: string, concurrency: number = 1, n
       fs.mkdirSync(projectArchive, { recursive: true });
 
       const archivePath = path.join(projectArchive, file);
-      const maxIndexedLine = (db.prepare(
-        'SELECT COALESCE(MAX(line_end), 0) AS maxLine FROM exchanges WHERE archive_path = ?'
-      ).get(archivePath) as { maxLine: number }).maxLine;
-
       // Archive + parse — source may vanish mid-run (Claude Code cleanup).
       let exchanges;
       try {
@@ -259,7 +255,7 @@ export async function indexSession(sessionId: string, concurrency: number = 1, n
       }
 
       if (exchanges.length > 0) {
-        const newExchanges = exchanges.filter(exchange => exchange.lineStart > maxIndexedLine);
+        const newExchanges = getExchangesNeedingIndex(db, archivePath, exchanges);
         // Generate summary (unless --no-summaries)
         const summaryPath = archivePath.replace('.jsonl', '-summary.txt');
         if (!noSummaries && shouldQueueForSummary(summaryPath)) {
@@ -357,13 +353,6 @@ export async function indexUnprocessed(concurrency: number = 1, noSummaries: boo
       const archivePath = path.join(projectArchive, file);
       const summaryPath = archivePath.replace('.jsonl', '-summary.txt');
 
-      // High-water mark: index exchanges past the last line we've already covered.
-      // Transcript JSONLs are append-only, so MAX(line_end) tells us where to resume.
-      const hw = db.prepare(
-        'SELECT COALESCE(MAX(line_end), 0) as maxLine FROM exchanges WHERE archive_path = ?'
-      ).get(archivePath) as { maxLine: number };
-      const maxIndexedLine = hw.maxLine;
-
       // Ensure parent dirs exist for subagent files
       try {
         fs.mkdirSync(path.dirname(archivePath), { recursive: true });
@@ -371,11 +360,9 @@ export async function indexUnprocessed(concurrency: number = 1, noSummaries: boo
         // Refresh the archive when the source may have grown beyond what we've seen.
         await archiveAdmittedConversation(sourcePath, archivePath);
 
-        // Parse and filter to exchanges past the high-water mark
+        // Parse and select only new or extended exchange spans.
         const exchanges = await parseConversation(sourcePath, project, archivePath);
-        const newExchanges = maxIndexedLine > 0
-          ? exchanges.filter(e => e.lineStart > maxIndexedLine)
-          : exchanges;
+        const newExchanges = getExchangesNeedingIndex(db, archivePath, exchanges);
         if (newExchanges.length === 0) continue;
 
         unprocessed.push({ project, file, sourcePath, archivePath, summaryPath, exchanges: newExchanges });
