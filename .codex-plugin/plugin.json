@@ -1,7 +1,7 @@
 {
   "name": "episodic-memory",
-  "version": "1.6.0+codex.20260927091139",
-  "description": "Semantic search for Claude Code and Codex conversations. Remember past discussions, decisions, and patterns.",
+  "version": "1.6.0+codex.20260930065544",
+  "description": "Semantic search for supported coding-agent conversations. Remember past discussions, decisions, and patterns.",
   "author": {
     "name": "Jesse Vincent",
     "email": "jesse@fsck.com"
@@ -20,9 +20,9 @@
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Episodic Memory",
-    "shortDescription": "Cross-harness conversation memory for Claude Code and Codex",
+    "shortDescription": "Cross-agent conversation recall",
     "defaultPrompt": "Find relevant prior conversation context and explain its evidence and limits.",
-    "longDescription": "Episodic Memory indexes coding-agent conversations and exposes semantic recall across Claude Code and Codex sessions.",
+    "longDescription": "Episodic Memory indexes supported coding-agent transcripts and exposes source-linked semantic recall through MCP.",
     "developerName": "Jesse Vincent",
     "category": "Developer Tools",
     "capabilities": [

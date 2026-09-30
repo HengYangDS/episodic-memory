@@ -239,7 +239,7 @@ export async function indexSession(sessionId, concurrency = 1, noSummaries = fal
                     if (oversizeSkipped > 0) {
                         console.log(`  Skipped ${oversizeSkipped} oversize exchange(s) (> ${maxMessageBytes} bytes; set EPISODIC_MEMORY_MAX_MESSAGE_BYTES to change) — likely embedded-transcript payloads (#139)`);
                     }
-                    console.log(`✅ Indexed session ${sessionId}: ${newExchanges.length} new exchanges`);
+                    console.log(`✅ Indexed session ${sessionId}: ${newExchanges.length} new or updated exchanges`);
                 }
                 db.close();
                 break;

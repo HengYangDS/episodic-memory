@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { initDatabase, migrateSchema, insertExchange } from '../src/db.js';
+import { getExchangesNeedingIndex, initDatabase, migrateSchema, insertExchange } from '../src/db.js';
 import { ConversationExchange } from '../src/types.js';
 import { suppressConsole } from './test-utils.js';
 import fs from 'fs';
@@ -141,6 +141,21 @@ describe('insertExchange with last_indexed', () => {
     expect(() => insertExchange(db, { ...first, id: 'span-2', lineEnd: 3 }, [0.2])).toThrow();
     expect(db.prepare('SELECT id FROM exchanges').all()).toEqual([{ id: 'span-1' }]);
     expect(db.prepare('SELECT COUNT(*) AS count FROM vec_exchanges').get()).toEqual({ count: 1 });
+    db.close();
+  });
+
+  it('refuses a contracted source span rather than replacing indexed history', () => {
+    const db = initDatabase();
+    const first: ConversationExchange = {
+      id: 'span-long', project: 'test-project', timestamp: '2024-01-01T00:00:00Z',
+      userMessage: 'Question', assistantMessage: 'Long answer',
+      archivePath: '/test/continued.jsonl', lineStart: 1, lineEnd: 3,
+    };
+    insertExchange(db, first, new Array(384).fill(0.1));
+
+    expect(() => getExchangesNeedingIndex(db, first.archivePath, [{ ...first, id: 'span-short', lineEnd: 2 }]))
+      .toThrow('Conversation exchange span regressed');
+    expect(db.prepare('SELECT id FROM exchanges').all()).toEqual([{ id: 'span-long' }]);
     db.close();
   });
 });

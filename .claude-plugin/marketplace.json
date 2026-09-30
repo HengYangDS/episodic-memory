@@ -8,8 +8,8 @@
   "plugins": [
     {
       "name": "episodic-memory",
-      "description": "Semantic search for Claude Code conversations. Remember past discussions, decisions, and patterns.",
-      "version": "1.6.0+codex.20260927091139",
+      "description": "Semantic search for supported coding-agent conversations. Remember past discussions, decisions, and patterns.",
+      "version": "1.6.0+codex.20260930065544",
       "source": "./",
       "author": {
         "name": "Jesse Vincent",

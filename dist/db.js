@@ -229,9 +229,24 @@ export function insertExchange(db, exchange, embedding, toolNames) {
 }
 /** Select new or extended exchanges without re-embedding stable indexed spans. */
 export function getExchangesNeedingIndex(db, archivePath, exchanges) {
-    const indexed = new Set(db.prepare('SELECT line_start AS lineStart, line_end AS lineEnd FROM exchanges WHERE archive_path = ?')
-        .all(archivePath).map(row => `${row.lineStart}:${row.lineEnd}`));
-    return exchanges.filter(exchange => !indexed.has(`${exchange.lineStart}:${exchange.lineEnd}`));
+    const indexed = new Map();
+    const rows = db.prepare('SELECT line_start AS lineStart, line_end AS lineEnd FROM exchanges WHERE archive_path = ?')
+        .all(archivePath);
+    for (const row of rows) {
+        const prior = indexed.get(row.lineStart);
+        indexed.set(row.lineStart, {
+            maxEnd: Math.max(prior?.maxEnd ?? row.lineEnd, row.lineEnd),
+            count: (prior?.count ?? 0) + 1,
+        });
+    }
+    return exchanges.filter(exchange => {
+        const prior = indexed.get(exchange.lineStart);
+        if (!prior)
+            return true;
+        if (exchange.lineEnd < prior.maxEnd)
+            throw new Error('Conversation exchange span regressed');
+        return exchange.lineEnd > prior.maxEnd || prior.count > 1;
+    });
 }
 export function getAllExchanges(db) {
     const stmt = db.prepare(`SELECT id, archive_path as archivePath FROM exchanges`);
