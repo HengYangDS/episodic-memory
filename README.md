@@ -216,16 +216,22 @@ episodic-memory-index
 episodic-memory-search "query"
 ```
 
-### In Claude Code, Codex, or opencode
+### Across MCP-capable agents
 
-The plugin automatically syncs and indexes conversations from the harness that starts it. Reference past work in natural conversation — the `remembering-conversations` skill dispatches the `search-conversations` agent automatically when recall is needed. Example prompts:
+The plugin's native integrations sync and index conversations from supported
+source harnesses. Other MCP clients can search the same admitted index without
+gaining automatic transcript sync. The portable `remembering-conversations`
+Skill uses the current host's MCP `search` and `read` tools, not a fixed tool
+namespace or a required subagent. Example prompts:
 
 - "How did we handle authentication in React Router?"
 - "The conversation about async testing patterns"
 - "Error message about sqlite-vec initialization"
 - "Git commit SHA for the routing refactor"
 
-In Codex and opencode, the skill guides the agent to use the episodic-memory MCP search/read tools directly when an agent-dispatch path is not available.
+Link the Skill into an agent's supported Skill root only after that client's
+MCP transport and source-access policy have been qualified. Installing a Skill
+file alone does not prove that a running agent loaded it.
 
 ## API Configuration
 

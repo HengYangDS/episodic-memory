@@ -1,88 +1,19 @@
 ---
 name: remembering-conversations
-description: You MUST invoke this skill before saying "I don't know," guessing, or treating any topic as new, no matter how trivial the question seems. It supplements other memory systems, which only hold partial records. Searching past conversations is the only way to recover what was actually said.
+description: Use when past agent conversations may contain decisions, rationale, solutions, or context needed for the current request, or before claiming a topic was never discussed.
 ---
 
 # Remembering Conversations
 
-**Core principle:** Search before reinventing. Searching costs nothing; reinventing or repeating mistakes costs everything.
+Episodic Memory retrieves source-linked historical conversations. It is a recall aid, not a session, task, policy, or current-state authority.
 
-## Mandatory: Search Historical Memory
+## Recall procedure
 
-**YOU MUST search historical memory for any historical search.**
+1. Find the `episodic-memory` MCP server exposed by the current agent. Tool names may be prefixed by the host; select that server's `search` and `read` tools by their descriptions and schemas rather than assuming one host-specific name.
+2. Search for the user's topic or the decision to recover. Use a narrow query and a bounded result limit. For primary-thread evidence only, set `include_sidechains` to `false`.
+3. Read only the relevant 2-5 results or line ranges, not entire large transcripts by default. Cite the returned source path and line range when explaining what was said.
+4. Separate historical claims from current facts. Recheck the live repository, service, issue, or session owner before an effectful action or present-tense completion claim.
 
-Announce: "Searching past conversations for [topic]."
+Do not import, summarize, repair, unarchive, or recreate a conversation merely to improve recall. Respect intentional deletions and record exclusions. If the tools are unavailable, state that historical retrieval was not verified; do not invent a conversation or treat another memory layer as a verbatim transcript.
 
-### Claude Code
-
-Use the Task tool with `subagent_type: "search-conversations"`:
-
-```
-Task tool:
-  description: "Search past conversations for [topic]"
-  prompt: "Search for [specific query or topic]. Focus on [what you're looking for - e.g., decisions, patterns, gotchas, code examples]."
-  subagent_type: "search-conversations"
-```
-
-### Codex
-
-If a `search-conversations` agent is available, dispatch it with the same prompt. If not, use the MCP tools directly:
-
-1. Search with the episodic-memory `search` tool
-2. Read the top 2-5 results with the episodic-memory `read` tool
-3. Synthesize findings in your response
-4. Include source pointers so the user can inspect the original conversations
-
-The search workflow will:
-1. Search with the `search` tool
-2. Read top 2-5 results with the `read` tool
-3. Synthesize findings (200-1000 words)
-4. Return actionable insights + sources
-
-**Saves 50-100x context vs. loading raw conversations.**
-
-### opencode
-
-Use the MCP tools directly unless a local search agent is available:
-
-1. Search with the episodic-memory `search` tool
-2. Read the top 2-5 results with the episodic-memory `read` tool
-3. Synthesize findings in your response
-4. Include source pointers so the user can inspect the original conversations
-
-## When to Use
-
-Use this whenever the current task would benefit from information you may have learned before, even if the user did not explicitly ask you to search.
-
-**When past experience may help:**
-- You need to recall decisions, rationale, patterns, solutions, pitfalls, or project context from earlier work
-- A task resembles something you've solved, debugged, reviewed, released, or planned before
-- You need to repeat a workflow or process that may have prior gotchas or established steps
-
-**When you're stuck:**
-- You've investigated a problem and can't find the solution
-- Facing a complex problem without obvious solution in current code
-- Need to follow an unfamiliar workflow or process
-
-**When historical signals are present:**
-- User says "last time", "before", "we discussed", "you implemented"
-- User asks "why did we...", "what was the reason..."
-- User says "do you remember...", "what do we know about..."
-
-**Before answering from uncertainty:**
-- Before guessing from memory or saying "I don't know" about something that may have been learned in a past conversation, search memory unless the current conversation already answers it
-
-**Don't search first:**
-- For current codebase structure (use Grep/Read to explore first)
-- For info in current conversation
-- Before understanding what you're being asked to do
-
-## Direct MCP Tool Access
-
-Use these directly when a search agent is unavailable or the current harness does not support agent dispatch:
-- `mcp__plugin_episodic-memory_episodic-memory__search`
-- `mcp__plugin_episodic-memory_episodic-memory__read`
-
-When using MCP tools directly, keep context small: search first, then read only the top 2-5 relevant conversations or line ranges.
-
-See MCP-TOOLS.md for complete API reference if needed for advanced usage.
+For parameter details, read [MCP-TOOLS.md](MCP-TOOLS.md).

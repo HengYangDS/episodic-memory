@@ -303,9 +303,11 @@ describe('pinned record-local screening at native admission', () => {
   });
 
   it('rejects scanner mutation during execution and cleans private work directories', () => {
-    const before = fs.readdirSync(os.tmpdir()).filter(name => name.startsWith('episodic-screen-')).sort();
+    const privateTmp = path.join(root, 'scanner-tmp');
+    fs.mkdirSync(privateTmp);
+    process.env.TMPDIR = privateTmp;
     scannerProbe("require('node:fs').appendFileSync(__filename, '\\n// changed'); process.stdout.write('[]');");
     expect(() => admitExchange(exchange())).toThrow(/screening unavailable/i);
-    expect(fs.readdirSync(os.tmpdir()).filter(name => name.startsWith('episodic-screen-')).sort()).toEqual(before);
+    expect(fs.readdirSync(privateTmp)).toEqual([]);
   });
 });

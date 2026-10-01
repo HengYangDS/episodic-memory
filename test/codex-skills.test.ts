@@ -8,15 +8,26 @@ function read(relPath: string): string {
   return readFileSync(join(REPO_ROOT, relPath), 'utf-8');
 }
 
-describe('Codex-aware skills', () => {
-  it('documents Claude Code, Codex, and opencode invocation paths in the skill', () => {
+describe('portable conversation recall skill', () => {
+  it('routes historical recall through the MCP tool contract without a client-specific tool name', () => {
     const skill = read('skills/remembering-conversations/SKILL.md');
 
-    expect(skill).toContain('Claude Code');
-    expect(skill).toContain('Codex');
-    expect(skill).toContain('opencode');
-    expect(skill).toContain('Task tool');
-    expect(skill).toContain('MCP tools directly');
+    expect(skill).toContain('Episodic Memory');
+    expect(skill).toContain('search');
+    expect(skill).toContain('read');
+    expect(skill).toContain('source');
+    expect(skill).not.toContain('mcp__plugin_episodic-memory');
+    expect(skill).not.toContain('subagent_type');
+  });
+
+  it('documents the current portable MCP parameters without claiming universal latency', () => {
+    const reference = read('skills/remembering-conversations/MCP-TOOLS.md');
+
+    expect(reference).toContain('session_id');
+    expect(reference).toContain('git_branch');
+    expect(reference).toContain('include_sidechains');
+    expect(reference).not.toContain('mcp__plugin_episodic-memory');
+    expect(reference).not.toContain('< 100ms typically');
   });
 
   it('describes episodic memory as cross-harness instead of Claude-only', () => {

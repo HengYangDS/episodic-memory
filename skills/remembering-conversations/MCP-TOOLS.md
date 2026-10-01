@@ -1,137 +1,33 @@
 # Episodic Memory MCP Tools Reference
 
-The episodic-memory plugin exposes two MCP tools for searching and displaying past Claude Code, Codex, and opencode conversations.
+The `episodic-memory` server searches supported Claude Code, Codex, and opencode conversations, as well as other transcript sources admitted by the installed version. MCP hosts may prefix tool names; discover the server's current tool list instead of copying one client's namespace.
 
 ## search
 
-Search your episodic memory of past Claude Code, Codex, and opencode conversations using semantic or text search.
-
-**Tool name:** `mcp__plugin_episodic-memory_episodic-memory__search`
-
-### Parameters
+Search historical conversations using semantic similarity, exact text, or both.
 
 | Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `query` | `string` or `string[]` | Yes | Search query. String for single-concept search, array of 2-5 strings for multi-concept AND search |
-| `mode` | `"vector"` \| `"text"` \| `"both"` | No | Search mode (default: `"both"`). Only used for single-concept searches |
-| `limit` | `number` | No | Maximum results to return, 1-50 (default: 10) |
-| `after` | `string` | No | Only return conversations after this date (YYYY-MM-DD) |
-| `before` | `string` | No | Only return conversations before this date (YYYY-MM-DD) |
-| `response_format` | `"markdown"` \| `"json"` | No | Output format (default: `"markdown"`) |
+| --- | --- | --- | --- |
+| `query` | string or 2-5 strings | Yes | Single concept or multi-concept AND search |
+| `mode` | `vector`, `text`, or `both` | No | Default `both`; applies to a single query |
+| `limit` | integer 1-50 | No | Default 10 |
+| `after`, `before` | `YYYY-MM-DD` | No | Date bounds |
+| `project` | string | No | Exact project name |
+| `session_id` | string | No | Exact source session ID |
+| `git_branch` | string | No | Exact branch name |
+| `include_sidechains` | boolean | No | Default true; set false for main threads only |
+| `response_format` | `markdown` or `json` | No | Default `markdown` |
 
-### Search Modes
-
-- **`vector`** - Semantic similarity search using embeddings
-- **`text`** - Exact text matching (case-insensitive)
-- **`both`** - Combined semantic + text search (default, recommended)
-
-### Single-Concept Search
-
-```typescript
-{
-  query: "React Router authentication errors",
-  mode: "both",
-  limit: 10
-}
-```
-
-### Multi-Concept Search (AND)
-
-Search for conversations containing ALL concepts:
-
-```typescript
-{
-  query: ["authentication", "React Router", "error handling"],
-  limit: 10
-}
-```
-
-Note: `mode` is ignored for multi-concept searches (always uses vector similarity).
-
-### Date Filtering
-
-```typescript
-{
-  query: "refactoring patterns",
-  after: "2025-09-01",
-  before: "2025-10-01"
-}
-```
-
-### Response Format
-
-#### Markdown (default)
-
-Human-readable format with:
-- Project name and date
-- Conversation summary
-- Matched exchange snippet
-- Similarity score
-- File path and line numbers
-
-#### JSON
-
-Machine-readable format:
-```json
-{
-  "results": [...],
-  "count": 5,
-  "mode": "both"
-}
-```
+Results may include summaries, snippets, scores, source paths, and line numbers. Search ranking is not proof that a result answers the question; use `read` to inspect the relevant source.
 
 ## read
 
-Display a full conversation from episodic memory as markdown.
-
-**Tool name:** `mcp__plugin_episodic-memory_episodic-memory__read`
-
-### Parameters
+Read a source conversation through the same record-admission policy used by search.
 
 | Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `path` | `string` | Yes | Absolute path to the JSONL conversation file |
-| `startLine` | `number` | No | Starting line number (1-indexed, inclusive) |
-| `endLine` | `number` | No | Ending line number (1-indexed, inclusive) |
+| --- | --- | --- | --- |
+| `path` | absolute path | Yes | A path returned by search |
+| `startLine` | positive integer | No | First physical line, inclusive |
+| `endLine` | positive integer | No | Last physical line, inclusive |
 
-### Usage
-
-**Read entire conversation:**
-```typescript
-{
-  path: "/Users/name/.config/superpowers/conversation-archive/project/uuid.jsonl"
-}
-```
-
-**Read specific range:**
-```typescript
-{
-  path: "/Users/name/.config/superpowers/conversation-archive/project/uuid.jsonl",
-  startLine: 100,
-  endLine: 200
-}
-```
-
-### Response Format
-
-Markdown-formatted conversation with:
-- Message roles (user/assistant)
-- Content (including tool uses and results)
-- Line numbers for reference
-
-## Error Handling
-
-Both tools return errors as text content with `isError: true`:
-- Invalid parameters (validation errors)
-- File not found
-- Date parsing errors
-- Search failures
-
-## Performance Notes
-
-- **Search** is fast (< 100ms typically)
-- **Read** can be slow for large conversations
-  - Use `startLine`/`endLine` to paginate
-  - Conversations can be 1000+ lines
-- Vector search uses sqlite-vec with cached embeddings
-- Text search uses SQLite FTS5 full-text index
+Prefer a narrow `startLine`/`endLine` range. Large transcripts can be slow and contain sensitive context. Both tools report input, source, policy, or runtime failures as tool errors; do not turn an error or absent result into a healthy-history conclusion.
