@@ -93,7 +93,7 @@ Then start Codex, open `/plugins`, install and enable `episodic-memory` from
 The Codex plugin:
 - Syncs conversations from `~/.codex/sessions`
 - Exposes the same MCP search/read tools
-- Installs the same memory skill, with Codex-specific direct MCP guidance
+- Installs the portable conversation-recall Skill
 - Runs a `SessionStart` hook after the user reviews and trusts it in `/hooks`
 
 Enable plugin hooks before relying on automatic sync:
@@ -103,6 +103,13 @@ codex features enable plugin_hooks
 ```
 
 Then open `/hooks` in Codex, review the Episodic Memory hook, and press `t` to trust it. New or modified Codex hooks are listed but do not run until trusted.
+
+Before updating a native plugin installation, inspect **literal** process
+command paths and preserve the versioned cache still used by live MCP servers.
+An update can remove the predecessor cache while old sessions continue running;
+native modules then fail to load from their original path. Do not kill those
+sessions or treat their cache as disposable. Retire a predecessor only after no
+process references it and the replacement has passed a real search/read probe.
 
 See [docs/CODEX.md](docs/CODEX.md) for the full Codex setup, trust, troubleshooting, and E2E test workflow.
 
