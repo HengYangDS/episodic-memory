@@ -27,7 +27,7 @@ export interface RecordExclusions {
 export declare function readRecordExclusions(): RecordExclusions | null;
 export declare function excludedSession(policy: RecordExclusions | null, sessionId?: string): boolean;
 /** Read original inputs without mutation, preserving their physical line numbers. */
-export declare function admittedConversationLines(file: string, policy?: RecordExclusions | null): AsyncGenerator<string>;
+export declare function admittedConversationLines(file: string, policy?: RecordExclusions | null, batchRecords?: number): AsyncGenerator<string>;
 /** Read the admitted display input without changing original physical coordinates. */
 export declare function readAdmittedConversation(file: string, startLine?: number, endLine?: number): Promise<string>;
 /** Enforce the same rule for direct callers that bypass transcript parsing. */

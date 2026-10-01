@@ -3,7 +3,7 @@ import path from 'path';
 import crypto from 'crypto';
 import { admittedConversationLines } from './record-admission.js';
 async function detectConversationHarness(filePath) {
-    const rl = admittedConversationLines(filePath);
+    const rl = admittedConversationLines(filePath, undefined, 1);
     for await (const line of rl) {
         if (!line.trim())
             continue;

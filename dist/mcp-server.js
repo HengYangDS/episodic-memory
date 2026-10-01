@@ -35038,7 +35038,7 @@ import fs2 from "node:fs";
 import path2 from "node:path";
 import crypto from "node:crypto";
 import os2 from "node:os";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 
 // src/constants.ts
 var SUMMARIZER_CONTEXT_MARKER = "Context: This summary will be shown in a list to help users and Claude choose which conversations are relevant";
@@ -35096,6 +35096,43 @@ var EXCLUSION_MARKERS = [
   SUMMARIZER_CONTEXT_MARKER
 ];
 var MARKER_SCAN_CHUNK_BYTES = 1 << 20;
+var SCREENING_BATCH_RECORDS = 16;
+var SCREENING_BATCH_BYTES = 8 * 1024 * 1024;
+var SCREENING_PARALLELISM = 4;
+var ASYNC_SCREENING_PARALLELISM = SCREENING_PARALLELISM - 1;
+var SCANNER_OUTPUT_LIMIT = 1048576;
+var availableScannerSlots = ASYNC_SCREENING_PARALLELISM;
+var scannerWaiters = [];
+function releaseScannerSlot() {
+  const waiter = scannerWaiters.shift();
+  if (waiter) {
+    waiter.signal.removeEventListener("abort", waiter.abort);
+    waiter.resolve(releaseScannerSlot);
+  } else {
+    availableScannerSlots++;
+  }
+}
+function acquireScannerSlot(signal) {
+  if (signal.aborted) return Promise.reject(new Error("Record screening unavailable"));
+  if (availableScannerSlots > 0 && scannerWaiters.length === 0) {
+    availableScannerSlots--;
+    return Promise.resolve(releaseScannerSlot);
+  }
+  return new Promise((resolve, reject) => {
+    const waiter = {
+      resolve,
+      reject,
+      signal,
+      abort: () => {
+        const index = scannerWaiters.indexOf(waiter);
+        if (index >= 0) scannerWaiters.splice(index, 1);
+        reject(new Error("Record screening unavailable"));
+      }
+    };
+    scannerWaiters.push(waiter);
+    signal.addEventListener("abort", waiter.abort, { once: true });
+  });
+}
 function instructionText(record2) {
   if (!object3(record2)) return "";
   if (record2.type === "event_msg" && object3(record2.payload)) {
@@ -35223,6 +35260,7 @@ function screeningText(value, depth = 0) {
 function createRecordScreener(policy) {
   const config2 = policy?.screening;
   if (!config2) return { scan() {
+  }, async scanMany() {
   }, close() {
   } };
   const unavailable = () => new Error("Record screening unavailable");
@@ -35258,51 +35296,139 @@ function createRecordScreener(policy) {
       throw unavailable();
     }
   };
+  const args = [
+    "stdin",
+    "--redact",
+    "--no-banner",
+    "--log-level",
+    "error",
+    "--ignore-gitleaks-allow",
+    "--exit-code",
+    "10",
+    "--report-format",
+    "json",
+    "--report-path",
+    "-"
+  ];
+  const environment = { HOME: directory, USERPROFILE: directory, PATH: path2.dirname(config2.executable) };
+  const prepare = (value) => {
+    const raw = typeof value === "string" ? value : JSON.stringify(value);
+    if (raw === void 0) return null;
+    if (Buffer.byteLength(raw) > config2.max_record_bytes) throw new Error("Record screening byte limit exceeded");
+    const input2 = screeningText(value);
+    if (Buffer.byteLength(input2) > config2.max_record_bytes) throw new Error("Record screening byte limit exceeded");
+    return input2.trim() ? input2 : null;
+  };
+  const validate2 = (status, signal, stdout, failed) => {
+    if (failed || signal || ![0, 10].includes(status ?? -1)) throw unavailable();
+    let report;
+    try {
+      report = JSON.parse(stdout);
+    } catch {
+      throw unavailable();
+    }
+    if (!Array.isArray(report) || status === 0 && report.length !== 0 || status === 10 && (report.length === 0 || !report.every((item) => object3(item) && typeof item.RuleID === "string"))) {
+      throw unavailable();
+    }
+    if (status === 10) throw new Error("Record content rejected by screening");
+  };
+  const scanInput = (input2) => {
+    unchanged();
+    const result = spawnSync(config2.executable, args, {
+      input: input2,
+      encoding: "utf8",
+      cwd: directory,
+      shell: false,
+      env: environment,
+      timeout: config2.timeout_ms,
+      killSignal: "SIGKILL",
+      maxBuffer: SCANNER_OUTPUT_LIMIT,
+      windowsHide: true
+    });
+    unchanged();
+    validate2(result.status, result.signal, result.stdout, !!result.error);
+  };
+  const scanInputAsync = (input2, signal) => new Promise((resolve, reject) => {
+    unchanged();
+    const child = spawn(config2.executable, args, {
+      cwd: directory,
+      shell: false,
+      env: environment,
+      timeout: config2.timeout_ms,
+      killSignal: "SIGKILL",
+      signal,
+      windowsHide: true,
+      stdio: ["pipe", "pipe", "pipe"]
+    });
+    let stdout = "";
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let failed = false;
+    child.stdout.on("data", (chunk) => {
+      stdoutBytes += chunk.length;
+      if (stdoutBytes > SCANNER_OUTPUT_LIMIT) {
+        failed = true;
+        child.kill("SIGKILL");
+      } else {
+        stdout += chunk.toString("utf8");
+      }
+    });
+    child.stderr.on("data", (chunk) => {
+      stderrBytes += chunk.length;
+      if (stderrBytes > SCANNER_OUTPUT_LIMIT) {
+        failed = true;
+        child.kill("SIGKILL");
+      }
+    });
+    child.stdin.on("error", () => {
+      failed = true;
+      child.kill("SIGKILL");
+    });
+    child.on("error", () => {
+      failed = true;
+    });
+    child.on("close", (status, signal2) => {
+      try {
+        unchanged();
+        validate2(status, signal2, stdout, failed);
+        resolve();
+      } catch (error61) {
+        reject(error61);
+      }
+    });
+    child.stdin.end(input2);
+  });
   return {
     scan(value) {
-      const raw = typeof value === "string" ? value : JSON.stringify(value);
-      if (raw === void 0) return;
-      if (Buffer.byteLength(raw) > config2.max_record_bytes) throw new Error("Record screening byte limit exceeded");
-      const input2 = screeningText(value);
-      if (Buffer.byteLength(input2) > config2.max_record_bytes) throw new Error("Record screening byte limit exceeded");
-      if (!input2.trim()) return;
-      unchanged();
-      const result = spawnSync(config2.executable, [
-        "stdin",
-        "--redact",
-        "--no-banner",
-        "--log-level",
-        "error",
-        "--ignore-gitleaks-allow",
-        "--exit-code",
-        "10",
-        "--report-format",
-        "json",
-        "--report-path",
-        "-"
-      ], {
-        input: input2,
-        encoding: "utf8",
-        cwd: directory,
-        shell: false,
-        env: { HOME: directory, USERPROFILE: directory, PATH: path2.dirname(config2.executable) },
-        timeout: config2.timeout_ms,
-        killSignal: "SIGKILL",
-        maxBuffer: 1048576,
-        windowsHide: true
-      });
-      unchanged();
-      if (result.error || result.signal || ![0, 10].includes(result.status ?? -1)) throw unavailable();
-      let report;
-      try {
-        report = JSON.parse(result.stdout);
-      } catch {
-        throw unavailable();
-      }
-      if (!Array.isArray(report) || result.status === 0 && report.length !== 0 || result.status === 10 && (report.length === 0 || !report.every((item) => object3(item) && typeof item.RuleID === "string"))) {
-        throw unavailable();
-      }
-      if (result.status === 10) throw new Error("Record content rejected by screening");
+      const input2 = prepare(value);
+      if (input2 !== null) scanInput(input2);
+    },
+    async scanMany(values) {
+      const inputs = values.map(prepare);
+      const cancellation = new AbortController();
+      let firstError;
+      let next = 0;
+      await Promise.all(Array.from({ length: Math.min(ASYNC_SCREENING_PARALLELISM, inputs.length) }, async () => {
+        while (next < inputs.length && !firstError) {
+          const index = next++;
+          const input2 = inputs[index];
+          if (input2 === null) continue;
+          try {
+            const release = await acquireScannerSlot(cancellation.signal);
+            try {
+              await scanInputAsync(input2, cancellation.signal);
+            } finally {
+              release();
+            }
+          } catch (error61) {
+            if (!firstError) {
+              firstError = error61 instanceof Error ? error61 : unavailable();
+              cancellation.abort();
+            }
+          }
+        }
+      }));
+      if (firstError) throw firstError;
     },
     close() {
       fs2.rmSync(directory, { recursive: true, force: true });
@@ -35376,7 +35502,10 @@ function filterRecord(line, number4, policy, transcript, sessionId) {
   }
   return line;
 }
-async function* admittedRecords(file2, policy, startLine = 1, endLine = Infinity) {
+async function* admittedRecords(file2, policy, startLine = 1, endLine = Infinity, batchRecords = SCREENING_BATCH_RECORDS) {
+  if (!Number.isSafeInteger(batchRecords) || batchRecords < 1 || batchRecords > SCREENING_BATCH_RECORDS) {
+    throw new Error("Invalid record screening batch size");
+  }
   const policySnapshot = JSON.stringify(policy);
   assertUnchangedPolicy(policySnapshot);
   const input2 = fs2.openSync(file2, fs2.constants.O_RDONLY | fs2.constants.O_NOFOLLOW);
@@ -35388,6 +35517,9 @@ async function* admittedRecords(file2, policy, startLine = 1, endLine = Infinity
   let sessionId = sessionFromPath(file2);
   let primaryIdentitySeen = false;
   let number4 = 0;
+  const batch = [];
+  const batchLimit = policy?.screening ? batchRecords : 1;
+  let batchBytes = 0;
   const admit = (bytes, terminated) => {
     number4++;
     const crlf = terminated && bytes.at(-1) === 13;
@@ -35405,8 +35537,18 @@ async function* admittedRecords(file2, policy, startLine = 1, endLine = Infinity
       primaryIdentitySeen = true;
     }
     const filtered = number4 >= startLine && number4 <= endLine ? filterRecord(line, number4, policy, path2.basename(file2), sessionId) : "";
-    screener?.scan(filtered);
     return { line: filtered, ending: terminated ? crlf ? "\r\n" : "\n" : "" };
+  };
+  const flush = async function* () {
+    if (batch.length === 0) return;
+    if (policy?.screening) {
+      await screener?.scanMany(batch.map((record2) => record2.line));
+      assertUnchangedInput(file2, initial);
+      assertUnchangedPolicy(policySnapshot);
+    }
+    for (const record2 of batch) yield record2;
+    batch.length = 0;
+    batchBytes = 0;
   };
   try {
     if (descriptorHasExclusionMarker(input2)) return;
@@ -35419,12 +35561,23 @@ async function* admittedRecords(file2, policy, startLine = 1, endLine = Infinity
       pending = Buffer.concat([pending, chunk]);
       let newline;
       while ((newline = pending.indexOf(10)) !== -1) {
-        yield admit(pending.subarray(0, newline), true);
+        const bytes = pending.subarray(0, newline);
+        if (batch.length > 0 && batchBytes + bytes.length > SCREENING_BATCH_BYTES) yield* flush();
+        const record2 = admit(bytes, true);
+        batch.push(record2);
+        batchBytes += Buffer.byteLength(record2.line) + Buffer.byteLength(record2.ending);
         pending = pending.subarray(newline + 1);
+        if (batch.length === batchLimit || batchBytes >= SCREENING_BATCH_BYTES) yield* flush();
       }
       if (pending.length > 64 * 1024 * 1024) throw new Error("Conversation record exceeds admission byte limit");
     }
-    if (pending.length) yield admit(pending, false);
+    if (pending.length) {
+      if (batch.length > 0 && batchBytes + pending.length > SCREENING_BATCH_BYTES) yield* flush();
+      const record2 = admit(pending, false);
+      batch.push(record2);
+      batchBytes += Buffer.byteLength(record2.line);
+    }
+    yield* flush();
     assertUnchangedInput(file2, initial);
     assertUnchangedPolicy(policySnapshot);
   } finally {

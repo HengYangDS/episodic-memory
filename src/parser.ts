@@ -91,7 +91,7 @@ interface ExchangeBuilder {
 }
 
 async function detectConversationHarness(filePath: string): Promise<ConversationHarness> {
-  const rl = admittedConversationLines(filePath);
+  const rl = admittedConversationLines(filePath, undefined, 1);
 
   for await (const line of rl) {
     if (!line.trim()) continue;

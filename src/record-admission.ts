@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import os from 'node:os';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { SUMMARIZER_CONTEXT_MARKER } from './constants.js';
 import type { ConversationExchange } from './types.js';
 import { getSuperpowersDir } from './paths.js';
@@ -14,6 +14,53 @@ const EXCLUSION_MARKERS = [
 ];
 
 const MARKER_SCAN_CHUNK_BYTES = 1 << 20; // 1 MiB
+const SCREENING_BATCH_RECORDS = 16;
+const SCREENING_BATCH_BYTES = 8 * 1024 * 1024;
+const SCREENING_PARALLELISM = 4;
+// spawnSync blocks the event loop, so at most one synchronous scanner can run
+// in this process. Keep one slot for it while async scans use the other slots.
+const ASYNC_SCREENING_PARALLELISM = SCREENING_PARALLELISM - 1;
+const SCANNER_OUTPUT_LIMIT = 1_048_576;
+
+interface ScannerWaiter {
+  resolve: (release: () => void) => void;
+  reject: (error: Error) => void;
+  signal: AbortSignal;
+  abort: () => void;
+}
+
+let availableScannerSlots = ASYNC_SCREENING_PARALLELISM;
+const scannerWaiters: ScannerWaiter[] = [];
+
+function releaseScannerSlot(): void {
+  const waiter = scannerWaiters.shift();
+  if (waiter) {
+    waiter.signal.removeEventListener('abort', waiter.abort);
+    waiter.resolve(releaseScannerSlot);
+  } else {
+    availableScannerSlots++;
+  }
+}
+
+function acquireScannerSlot(signal: AbortSignal): Promise<() => void> {
+  if (signal.aborted) return Promise.reject(new Error('Record screening unavailable'));
+  if (availableScannerSlots > 0 && scannerWaiters.length === 0) {
+    availableScannerSlots--;
+    return Promise.resolve(releaseScannerSlot);
+  }
+  return new Promise((resolve, reject) => {
+    const waiter: ScannerWaiter = {
+      resolve, reject, signal,
+      abort: () => {
+        const index = scannerWaiters.indexOf(waiter);
+        if (index >= 0) scannerWaiters.splice(index, 1);
+        reject(new Error('Record screening unavailable'));
+      },
+    };
+    scannerWaiters.push(waiter);
+    signal.addEventListener('abort', waiter.abort, { once: true });
+  });
+}
 
 /** Scan decoded instruction records without retaining the whole transcript. */
 export function shouldSkipConversation(filePath: string): boolean {
@@ -204,9 +251,13 @@ function screeningText(value: unknown, depth = 0): string {
 }
 
 /** One pinned, short-lived local scanner context; no secret-bearing cache. */
-function createRecordScreener(policy: RecordExclusions | null): { scan(value: unknown): void; close(): void } {
+function createRecordScreener(policy: RecordExclusions | null): {
+  scan(value: unknown): void;
+  scanMany(values: unknown[]): Promise<void>;
+  close(): void;
+} {
   const config = policy?.screening;
-  if (!config) return { scan() {}, close() {} };
+  if (!config) return { scan() {}, async scanMany() {}, close() {} };
   const unavailable = () => new Error('Record screening unavailable');
   let initial: fs.Stats;
   let fd: number | undefined;
@@ -237,35 +288,107 @@ function createRecordScreener(policy: RecordExclusions | null): { scan(value: un
           current.ctimeMs !== initial.ctimeMs) throw unavailable();
     } catch { throw unavailable(); }
   };
+  const args = [
+    'stdin', '--redact', '--no-banner', '--log-level', 'error',
+    '--ignore-gitleaks-allow', '--exit-code', '10', '--report-format', 'json', '--report-path', '-',
+  ];
+  const environment = { HOME: directory, USERPROFILE: directory, PATH: path.dirname(config.executable) };
+  const prepare = (value: unknown): string | null => {
+    const raw = typeof value === 'string' ? value : JSON.stringify(value);
+    if (raw === undefined) return null;
+    if (Buffer.byteLength(raw) > config.max_record_bytes) throw new Error('Record screening byte limit exceeded');
+    const input = screeningText(value);
+    if (Buffer.byteLength(input) > config.max_record_bytes) throw new Error('Record screening byte limit exceeded');
+    return input.trim() ? input : null;
+  };
+  const validate = (status: number | null | undefined, signal: string | null | undefined,
+    stdout: string, failed: boolean): void => {
+    if (failed || signal || ![0, 10].includes(status ?? -1)) throw unavailable();
+    let report: unknown;
+    try { report = JSON.parse(stdout); } catch { throw unavailable(); }
+    if (!Array.isArray(report) || (status === 0 && report.length !== 0) ||
+        (status === 10 && (report.length === 0 || !report.every(item => object(item) && typeof item.RuleID === 'string')))) {
+      throw unavailable();
+    }
+    if (status === 10) throw new Error('Record content rejected by screening');
+  };
+  const scanInput = (input: string): void => {
+    unchanged();
+    const result = spawnSync(config.executable, args, {
+      input, encoding: 'utf8', cwd: directory, shell: false, env: environment,
+      timeout: config.timeout_ms, killSignal: 'SIGKILL', maxBuffer: SCANNER_OUTPUT_LIMIT,
+      windowsHide: true,
+    });
+    unchanged();
+    validate(result.status, result.signal, result.stdout, !!result.error);
+  };
+  const scanInputAsync = (input: string, signal: AbortSignal): Promise<void> => new Promise((resolve, reject) => {
+    unchanged();
+    const child = spawn(config.executable, args, {
+      cwd: directory, shell: false, env: environment,
+      timeout: config.timeout_ms, killSignal: 'SIGKILL', signal, windowsHide: true,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let failed = false;
+    child.stdout.on('data', (chunk: Buffer) => {
+      stdoutBytes += chunk.length;
+      if (stdoutBytes > SCANNER_OUTPUT_LIMIT) {
+        failed = true;
+        child.kill('SIGKILL');
+      } else {
+        stdout += chunk.toString('utf8');
+      }
+    });
+    child.stderr.on('data', (chunk: Buffer) => {
+      stderrBytes += chunk.length;
+      if (stderrBytes > SCANNER_OUTPUT_LIMIT) {
+        failed = true;
+        child.kill('SIGKILL');
+      }
+    });
+    child.stdin.on('error', () => { failed = true; child.kill('SIGKILL'); });
+    child.on('error', () => { failed = true; });
+    child.on('close', (status, signal) => {
+      try {
+        unchanged();
+        validate(status, signal, stdout, failed);
+        resolve();
+      } catch (error) { reject(error); }
+    });
+    child.stdin.end(input);
+  });
   return {
     scan(value: unknown) {
-      const raw = typeof value === 'string' ? value : JSON.stringify(value);
-      if (raw === undefined) return;
-      if (Buffer.byteLength(raw) > config.max_record_bytes) throw new Error('Record screening byte limit exceeded');
-      const input = screeningText(value);
-      if (Buffer.byteLength(input) > config.max_record_bytes) throw new Error('Record screening byte limit exceeded');
-      if (!input.trim()) return;
-      unchanged();
-      const result = spawnSync(config.executable, [
-        'stdin', '--redact', '--no-banner', '--log-level', 'error',
-        '--ignore-gitleaks-allow', '--exit-code', '10', '--report-format', 'json', '--report-path', '-',
-      ], {
-        input, encoding: 'utf8', cwd: directory, shell: false,
-        env: { HOME: directory, USERPROFILE: directory, PATH: path.dirname(config.executable) },
-        timeout: config.timeout_ms, killSignal: 'SIGKILL', maxBuffer: 1_048_576,
-        windowsHide: true,
-      });
-      unchanged();
-      // Exit zero alone is not a clean scan. Validate the full report and never
-      // forward stdout/stderr, findings, fingerprints or input into errors.
-      if (result.error || result.signal || ![0, 10].includes(result.status ?? -1)) throw unavailable();
-      let report: unknown;
-      try { report = JSON.parse(result.stdout); } catch { throw unavailable(); }
-      if (!Array.isArray(report) || (result.status === 0 && report.length !== 0) ||
-          (result.status === 10 && (report.length === 0 || !report.every(item => object(item) && typeof item.RuleID === 'string')))) {
-        throw unavailable();
-      }
-      if (result.status === 10) throw new Error('Record content rejected by screening');
+      const input = prepare(value);
+      if (input !== null) scanInput(input);
+    },
+    async scanMany(values: unknown[]) {
+      const inputs = values.map(prepare);
+      const cancellation = new AbortController();
+      let firstError: Error | undefined;
+      let next = 0;
+      await Promise.all(Array.from({ length: Math.min(ASYNC_SCREENING_PARALLELISM, inputs.length) }, async () => {
+        while (next < inputs.length && !firstError) {
+          const index = next++;
+          const input = inputs[index];
+          if (input === null) continue;
+          try {
+            const release = await acquireScannerSlot(cancellation.signal);
+            try { await scanInputAsync(input, cancellation.signal); }
+            finally { release(); }
+          }
+          catch (error) {
+            if (!firstError) {
+              firstError = error instanceof Error ? error : unavailable();
+              cancellation.abort();
+            }
+          }
+        }
+      }));
+      if (firstError) throw firstError;
     },
     close() { fs.rmSync(directory, { recursive: true, force: true }); },
   };
@@ -352,7 +475,11 @@ function filterRecord(line: string, number: number, policy: RecordExclusions | n
 }
 
 /** Keep byte delimiters and physical line coordinates stable in derived copies. */
-async function* admittedRecords(file: string, policy: RecordExclusions | null, startLine = 1, endLine = Infinity): AsyncGenerator<{ line: string; ending: string }> {
+async function* admittedRecords(file: string, policy: RecordExclusions | null, startLine = 1, endLine = Infinity,
+  batchRecords = SCREENING_BATCH_RECORDS): AsyncGenerator<{ line: string; ending: string }> {
+  if (!Number.isSafeInteger(batchRecords) || batchRecords < 1 || batchRecords > SCREENING_BATCH_RECORDS) {
+    throw new Error('Invalid record screening batch size');
+  }
   const policySnapshot = JSON.stringify(policy);
   assertUnchangedPolicy(policySnapshot);
   const input = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
@@ -364,6 +491,9 @@ async function* admittedRecords(file: string, policy: RecordExclusions | null, s
   let sessionId = sessionFromPath(file);
   let primaryIdentitySeen = false;
   let number = 0;
+  const batch: Array<{ line: string; ending: string }> = [];
+  const batchLimit = policy?.screening ? batchRecords : 1;
+  let batchBytes = 0;
   const admit = (bytes: Buffer, terminated: boolean) => {
     number++;
     const crlf = terminated && bytes.at(-1) === 13;
@@ -379,8 +509,18 @@ async function* admittedRecords(file: string, policy: RecordExclusions | null, s
     }
     const filtered = number >= startLine && number <= endLine
       ? filterRecord(line, number, policy, path.basename(file), sessionId) : '';
-    screener?.scan(filtered);
     return { line: filtered, ending: terminated ? (crlf ? '\r\n' : '\n') : '' };
+  };
+  const flush = async function* (): AsyncGenerator<{ line: string; ending: string }> {
+    if (batch.length === 0) return;
+    if (policy?.screening) {
+      await screener?.scanMany(batch.map(record => record.line));
+      assertUnchangedInput(file, initial);
+      assertUnchangedPolicy(policySnapshot);
+    }
+    for (const record of batch) yield record;
+    batch.length = 0;
+    batchBytes = 0;
   };
   try {
     // The marker scan and record stream share one descriptor and identity.
@@ -395,12 +535,23 @@ async function* admittedRecords(file: string, policy: RecordExclusions | null, s
       pending = Buffer.concat([pending, chunk]);
       let newline: number;
       while ((newline = pending.indexOf(10)) !== -1) {
-        yield admit(pending.subarray(0, newline), true);
+        const bytes = pending.subarray(0, newline);
+        if (batch.length > 0 && batchBytes + bytes.length > SCREENING_BATCH_BYTES) yield* flush();
+        const record = admit(bytes, true);
+        batch.push(record);
+        batchBytes += Buffer.byteLength(record.line) + Buffer.byteLength(record.ending);
         pending = pending.subarray(newline + 1);
+        if (batch.length === batchLimit || batchBytes >= SCREENING_BATCH_BYTES) yield* flush();
       }
       if (pending.length > 64 * 1024 * 1024) throw new Error('Conversation record exceeds admission byte limit');
     }
-    if (pending.length) yield admit(pending, false);
+    if (pending.length) {
+      if (batch.length > 0 && batchBytes + pending.length > SCREENING_BATCH_BYTES) yield* flush();
+      const record = admit(pending, false);
+      batch.push(record);
+      batchBytes += Buffer.byteLength(record.line);
+    }
+    yield* flush();
     assertUnchangedInput(file, initial);
     assertUnchangedPolicy(policySnapshot);
   } finally {
@@ -411,10 +562,11 @@ async function* admittedRecords(file: string, policy: RecordExclusions | null, s
 }
 
 /** Read original inputs without mutation, preserving their physical line numbers. */
-export async function* admittedConversationLines(file: string, policy = readRecordExclusions()): AsyncGenerator<string> {
+export async function* admittedConversationLines(file: string, policy = readRecordExclusions(),
+  batchRecords = SCREENING_BATCH_RECORDS): AsyncGenerator<string> {
   if (!fs.lstatSync(file).isFile()) throw new Error('Conversation input must be a regular non-symlink file');
   if (shouldSkipConversation(file)) return;
-  for await (const record of admittedRecords(file, policy)) yield record.line;
+  for await (const record of admittedRecords(file, policy, 1, Infinity, batchRecords)) yield record.line;
 }
 
 /** Read the admitted display input without changing original physical coordinates. */

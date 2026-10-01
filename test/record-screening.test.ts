@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -6,6 +6,7 @@ import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import {
   admitExchange,
+  admittedConversationLines,
   archiveAdmittedConversation,
   readAdmittedConversation,
   readRecordExclusions,
@@ -13,6 +14,7 @@ import {
 import { initDatabase, insertExchange } from '../src/db.js';
 import { searchConversations } from '../src/search.js';
 import { verifyIndex } from '../src/verify.js';
+import { parseConversation } from '../src/parser.js';
 import type { ConversationExchange } from '../src/types.js';
 
 const session = '00000000-1111-4222-8333-444444444444';
@@ -189,6 +191,220 @@ describe('pinned record-local screening at native admission', () => {
     await expect(readAdmittedConversation(source)).rejects.toThrow(/content rejected by screening/i);
   });
 
+  it('screens separate records concurrently without crossing a bounded process limit', async () => {
+    const log = path.join(root, 'scanner-events.jsonl');
+    scannerProbe(`const fs = require('node:fs');
+      fs.readFileSync(0);
+      const log = ${JSON.stringify(log)};
+      fs.appendFileSync(log, JSON.stringify({ phase: 'start', time: process.hrtime.bigint().toString() }) + '\\n');
+      setTimeout(() => {
+        fs.appendFileSync(log, JSON.stringify({ phase: 'end', time: process.hrtime.bigint().toString() }) + '\\n');
+        process.stdout.write('[]');
+      }, 120);`);
+    const lines = Array.from({ length: 8 }, (_, index) => JSON.stringify({
+      type: 'event_msg', payload: { type: 'user_message', message: `safe record ${index}` },
+    }));
+    fs.writeFileSync(source, lines.join('\n') + '\n');
+
+    expect(await readAdmittedConversation(source)).toBe(lines.join('\n'));
+    const events = fs.readFileSync(log, 'utf8').trim().split('\n')
+      .map(line => JSON.parse(line) as { phase: string; time: string })
+      .sort((left, right) => Number(BigInt(left.time) - BigInt(right.time)));
+    let active = 0;
+    let peak = 0;
+    for (const event of events) {
+      active += event.phase === 'start' ? 1 : -1;
+      peak = Math.max(peak, active);
+    }
+    expect(events).toHaveLength(16);
+    expect(active).toBe(0);
+    expect(peak).toBeGreaterThan(1);
+    expect(peak).toBeLessThanOrEqual(4);
+  });
+
+  it('flushes large screened records before the aggregate batch exceeds its byte cap', async () => {
+    const log = path.join(root, 'large-scanner-events.jsonl');
+    scannerProbe(`const fs = require('node:fs');
+      fs.readFileSync(0);
+      const log = ${JSON.stringify(log)};
+      fs.appendFileSync(log, JSON.stringify({ phase: 'start', time: process.hrtime.bigint().toString() }) + '\\n');
+      setTimeout(() => {
+        fs.appendFileSync(log, JSON.stringify({ phase: 'end', time: process.hrtime.bigint().toString() }) + '\\n');
+        process.stdout.write('[]');
+      }, 120);`);
+    const configured = JSON.parse(fs.readFileSync(path.join(root, 'record-exclusions.json'), 'utf8'));
+    policy({ ...configured.screening, max_record_bytes: 8_388_608 });
+    const lines = ['a', 'b'].map(letter => JSON.stringify({ message: letter.repeat(4_500_000) }));
+    fs.writeFileSync(source, lines.join('\n') + '\n');
+
+    expect((await readAdmittedConversation(source)).length).toBe(lines.join('\n').length);
+    const events = fs.readFileSync(log, 'utf8').trim().split('\n')
+      .map(line => JSON.parse(line) as { phase: string; time: string })
+      .sort((left, right) => Number(BigInt(left.time) - BigInt(right.time)));
+    let active = 0;
+    let peak = 0;
+    for (const event of events) {
+      active += event.phase === 'start' ? 1 : -1;
+      peak = Math.max(peak, active);
+    }
+    expect(events).toHaveLength(4);
+    expect(active).toBe(0);
+    expect(peak).toBe(1);
+  });
+
+  it('caps scanner processes across concurrent transcript reads in one server', async () => {
+    const log = path.join(root, 'shared-scanner-events.jsonl');
+    scannerProbe(`const fs = require('node:fs');
+      fs.readFileSync(0);
+      const log = ${JSON.stringify(log)};
+      fs.appendFileSync(log, JSON.stringify({ phase: 'start', time: process.hrtime.bigint().toString() }) + '\\n');
+      setTimeout(() => {
+        fs.appendFileSync(log, JSON.stringify({ phase: 'end', time: process.hrtime.bigint().toString() }) + '\\n');
+        process.stdout.write('[]');
+      }, 180);`);
+    const lines = Array.from({ length: 8 }, (_, index) => JSON.stringify({ message: `safe ${index}` }));
+    fs.writeFileSync(source, lines.join('\n') + '\n');
+
+    const [first, second] = await Promise.all([readAdmittedConversation(source), readAdmittedConversation(source)]);
+    expect(first).toBe(lines.join('\n'));
+    expect(second).toBe(first);
+    const events = fs.readFileSync(log, 'utf8').trim().split('\n')
+      .map(line => JSON.parse(line) as { phase: string; time: string })
+      .sort((left, right) => Number(BigInt(left.time) - BigInt(right.time)));
+    let active = 0;
+    let peak = 0;
+    for (const event of events) {
+      active += event.phase === 'start' ? 1 : -1;
+      peak = Math.max(peak, active);
+    }
+    expect(events).toHaveLength(32);
+    expect(active).toBe(0);
+    expect(peak).toBeGreaterThan(1);
+    expect(peak).toBeLessThanOrEqual(4);
+  });
+
+  it('reserves capacity for synchronous admission during concurrent transcript reads', async () => {
+    const log = path.join(root, 'mixed-scanner-events.jsonl');
+    scannerProbe(`const fs = require('node:fs');
+      fs.readFileSync(0);
+      const log = ${JSON.stringify(log)};
+      fs.appendFileSync(log, JSON.stringify({ phase: 'start', time: process.hrtime.bigint().toString() }) + '\\n');
+      setTimeout(() => {
+        fs.appendFileSync(log, JSON.stringify({ phase: 'end', time: process.hrtime.bigint().toString() }) + '\\n');
+        process.stdout.write('[]');
+      }, 500);`);
+    const lines = Array.from({ length: 8 }, (_, index) => JSON.stringify({ message: `safe ${index}` }));
+    fs.writeFileSync(source, lines.join('\n') + '\n');
+
+    const pending = readAdmittedConversation(source);
+    const deadline = performance.now() + 3000;
+    while ((!fs.existsSync(log) || fs.readFileSync(log, 'utf8').split('\n').filter(line => line.includes('start')).length < 3) &&
+      performance.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    expect(fs.existsSync(log)).toBe(true);
+    await new Promise(resolve => setTimeout(resolve, 30));
+    expect(admitExchange(exchange())).toEqual(exchange());
+    expect(await pending).toBe(lines.join('\n'));
+
+    const events = fs.readFileSync(log, 'utf8').trim().split('\n')
+      .map(line => JSON.parse(line) as { phase: string; time: string })
+      .sort((left, right) => Number(BigInt(left.time) - BigInt(right.time)));
+    let active = 0;
+    let peak = 0;
+    for (const event of events) {
+      active += event.phase === 'start' ? 1 : -1;
+      peak = Math.max(peak, active);
+    }
+    expect(events).toHaveLength(22);
+    expect(active).toBe(0);
+    expect(peak).toBeLessThanOrEqual(4);
+  });
+
+  it('keeps concurrent screening record-local when separate records form a false match together', async () => {
+    const lines = [
+      JSON.stringify({ type: 'event_msg', payload: { message: 'Sourcegraph' } }),
+      JSON.stringify({ type: 'event_msg', payload: { message: '0123456789abcdef0123456789abcdef01234567' } }),
+    ];
+    fs.writeFileSync(source, lines.join('\n') + '\n');
+    await expect(readAdmittedConversation(source)).resolves.toBe(lines.join('\n'));
+  });
+
+  it('screens only the first admitted record during harness detection', async () => {
+    const log = path.join(root, 'scanner-count');
+    scannerProbe(`const fs = require('node:fs');
+      fs.readFileSync(0);
+      fs.appendFileSync(${JSON.stringify(log)}, 'x');
+      process.stdout.write('[]');`);
+    const lines = transcript('safe question').trimEnd().split('\n');
+    while (lines.length < 20) lines.push(JSON.stringify({ type: 'event_msg', payload: { type: 'agent_message', message: 'safe' } }));
+    fs.writeFileSync(source, lines.join('\n') + '\n');
+
+    await parseConversation(source, 'fixture', source);
+    expect(fs.readFileSync(log, 'utf8').length).toBe(lines.length + 1);
+  });
+
+  it('removes a partial derived archive when a later screening batch rejects content', async () => {
+    const lines = Array.from({ length: 20 }, (_, index) => JSON.stringify({
+      type: 'event_msg', payload: { message: index === 17 ? token : `safe record ${index}` },
+    }));
+    fs.writeFileSync(source, lines.join('\n') + '\n');
+    await expect(archiveAdmittedConversation(source, destination)).rejects.toThrow(/content rejected by screening/i);
+    expect(fs.existsSync(destination)).toBe(false);
+    expect(fs.readdirSync(path.dirname(destination))).toEqual([]);
+  });
+
+  it('streams unscreened records before a later record-admission error', async () => {
+    const barePolicy = {
+      version: 1, exchanges: [{ session_id: session, transcript: path.basename(source), line_start: 2, line_end: 2 }],
+      tool_calls: [],
+    };
+    fs.writeFileSync(path.join(root, 'record-exclusions.json'), JSON.stringify(barePolicy));
+    const lines = [
+      JSON.stringify({ type: 'event_msg', payload: { type: 'agent_message', message: 'safe' } }),
+      JSON.stringify({ type: 'session_meta', payload: { id: '11111111-2222-4333-8444-555555555555' } }),
+    ];
+    fs.writeFileSync(source, lines.join('\n') + '\n');
+    const iterator = admittedConversationLines(source);
+    expect((await iterator.next()).value).toBe(lines[0]);
+    await expect(iterator.next()).rejects.toThrow(/session identity mismatch/i);
+  });
+
+  it('checks a stable unscreened policy per stream chunk rather than per record', async () => {
+    const policyFile = path.join(root, 'record-exclusions.json');
+    fs.writeFileSync(policyFile, JSON.stringify({ version: 1, exchanges: [], tool_calls: [] }));
+    const lines = Array.from({ length: 20 }, (_, index) => JSON.stringify({
+      type: 'event_msg', payload: { message: `safe record ${index}` },
+    }));
+    fs.writeFileSync(source, lines.join('\n') + '\n');
+    const opened = vi.spyOn(fs, 'openSync');
+    try {
+      expect(await readAdmittedConversation(source)).toBe(lines.join('\n'));
+      const policyOpens = opened.mock.calls.filter(([file]) => file === policyFile).length;
+      expect(policyOpens).toBeLessThanOrEqual(6);
+    } finally {
+      opened.mockRestore();
+    }
+  });
+
+  it('aborts in-flight record scanners after the first rejection', async () => {
+    scannerProbe(`const fs = require('node:fs');
+      const input = fs.readFileSync(0, 'utf8');
+      if (input.includes('reject-me')) {
+        process.stdout.write('[{"RuleID":"fixture"}]'); process.exit(10);
+      }
+      setInterval(() => {}, 1000);`);
+    const configured = JSON.parse(fs.readFileSync(path.join(root, 'record-exclusions.json'), 'utf8'));
+    policy({ ...configured.screening, timeout_ms: 1000 });
+    const lines = Array.from({ length: 16 }, (_, index) => JSON.stringify({
+      type: 'event_msg', payload: { message: index === 0 ? 'reject-me' : `safe ${index}` },
+    }));
+    fs.writeFileSync(source, lines.join('\n') + '\n');
+    const start = performance.now();
+    await expect(readAdmittedConversation(source)).rejects.toThrow(/content rejected by screening/i);
+    expect(performance.now() - start).toBeLessThan(2000);
+  });
+
   it('screens decoded JSON strings rather than trusting escaped token spelling', async () => {
     fs.writeFileSync(source, transcript(token).replace('ghp_', '\\u0067hp_'));
     await expect(archiveAdmittedConversation(source, destination)).rejects.toThrow(/content rejected by screening/i);
@@ -287,6 +503,18 @@ describe('pinned record-local screening at native admission', () => {
     fs.writeFileSync(file, JSON.stringify(configured));
     const start = performance.now();
     expect(() => admitExchange(exchange())).toThrow(/screening unavailable/i);
+    expect(performance.now() - start).toBeLessThan(3000);
+  });
+
+  it('terminates concurrently scheduled hung record scanners without exposing input', async () => {
+    scannerProbe('require(\'node:fs\').readFileSync(0); setInterval(() => {}, 1000);');
+    const configured = JSON.parse(fs.readFileSync(path.join(root, 'record-exclusions.json'), 'utf8'));
+    policy({ ...configured.screening, timeout_ms: 100 });
+    const start = performance.now();
+    let message = '';
+    try { await readAdmittedConversation(source); } catch (error) { message = String(error); }
+    expect(message).toMatch(/screening unavailable/i);
+    expect(message).not.toContain('safe question');
     expect(performance.now() - start).toBeLessThan(3000);
   });
 
