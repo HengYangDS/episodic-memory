@@ -607,7 +607,19 @@ isolated, inline allow comments are disabled, and original transcripts and
 previously published archives remain unchanged when admission fails.
 
 Screening keeps the configured per-record byte limit and process timeout. At
-most three asynchronous scanners run per server, reserving one slot for
+most `2N - 1` native attempts can screen a batch of `N` nonempty records. Only
+an explicit timer kill with no scanner output or diagnostics can trigger
+sequential binary subdivision of that same batch; each half must pass the
+unchanged identity, byte, report and policy checks. Other failures are never
+retried, and a timed-out singleton remains `Record screening unavailable`.
+The sum of native attempt deadlines is at most `(2N - 1) * timeout_ms`; packing,
+validation, queueing and process cleanup add wall time. For 1,024 records at
+2,000 ms, the conservative attempt budget is 4,094 seconds, not a whole-operation
+deadline. Use a caller-owned deadline for bounded traversals. Recovery retains
+one scanner slot until both halves pass and never releases partial safe records.
+These bounds do not weaken the scanner pin, record limits or fail-closed result.
+
+At most three asynchronous scanners run per server, reserving one slot for
 synchronous admission; a transcript flushes its batches sequentially. It is not
 an unbounded bulk collection service. Measure a finite representative batch
 before large imports, and give the complete caller its own wall-clock deadline.

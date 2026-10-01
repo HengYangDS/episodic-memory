@@ -130,6 +130,8 @@ process.exit(found ? 10 : 0);
 });
 
 afterEach(() => {
+  if (prior.TMPDIR === undefined) delete process.env.TMPDIR;
+  else process.env.TMPDIR = prior.TMPDIR;
   process.env = prior;
   fs.rmSync(root, { recursive: true, force: true });
   expect(fs.existsSync(root)).toBe(false);
@@ -674,6 +676,129 @@ describe('pinned record-local screening at native admission', () => {
     expect(message).toMatch(/screening unavailable/i);
     expect(message).not.toContain('safe question');
     expect(performance.now() - start).toBeLessThan(3000);
+  });
+
+  it('splits only a timed-out batch into sequential independent halves', async () => {
+    const log = path.join(root, 'timeout-recovery-calls');
+    const privateTmp = path.join(root, 'timeout-recovery-tmp');
+    fs.mkdirSync(privateTmp);
+    process.env.TMPDIR = privateTmp;
+    scannerProbe(`const fs = require('node:fs');
+      ${batchProbeReader}
+      const records = recordsForProbe();
+      fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(records.map(record =>
+        record.text.match(/recovery record (\\d+)/)[1])) + '\\n');
+      if (records.length > 2) setInterval(() => {}, 1000);
+      else process.stdout.write('[]');`);
+    const configured = JSON.parse(fs.readFileSync(path.join(root, 'record-exclusions.json'), 'utf8'));
+    policy({ ...configured.screening, timeout_ms: 2000 });
+    const lines = Array.from({ length: 4 }, (_, index) => JSON.stringify({ message: `recovery record ${index}` }));
+    fs.writeFileSync(source, lines.join('\n') + '\n');
+
+    expect(await readAdmittedConversation(source)).toBe(lines.join('\n'));
+    expect(fs.readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line)))
+      .toEqual([['0', '1', '2', '3'], ['0', '1'], ['2', '3']]);
+    expect(fs.readdirSync(privateTmp)).toEqual([]);
+  });
+
+  it('withholds safe neighbors when a timed-out batch has a rejected recovery half', async () => {
+    const log = path.join(root, 'timeout-rejected-calls');
+    const privateTmp = path.join(root, 'timeout-rejected-tmp');
+    fs.mkdirSync(privateTmp);
+    process.env.TMPDIR = privateTmp;
+    scannerProbe(`const fs = require('node:fs');
+      ${batchProbeReader}
+      const records = recordsForProbe();
+      fs.appendFileSync(${JSON.stringify(log)}, records.length + '\\n');
+      if (records.length > 2) setInterval(() => {}, 1000);
+      else {
+        const rejected = records.find(record => record.text.includes('reject-me'));
+        process.stdout.write(rejected ? JSON.stringify([{ RuleID: 'fixture', File: target + '!' + rejected.name }]) : '[]');
+        process.exit(rejected ? 10 : 0);
+      }`);
+    const configured = JSON.parse(fs.readFileSync(path.join(root, 'record-exclusions.json'), 'utf8'));
+    policy({ ...configured.screening, timeout_ms: 2000 });
+    fs.writeFileSync(source, ['safe zero', 'safe one', 'safe two', 'reject-me']
+      .map(message => JSON.stringify({ message })).join('\n') + '\n');
+    const visible: string[] = [];
+
+    await expect((async () => {
+      for await (const line of admittedConversationLines(source)) visible.push(line);
+    })()).rejects.toThrow('Record content rejected by screening');
+    expect(visible).toEqual([]);
+    expect(fs.readFileSync(log, 'utf8')).toBe('4\n2\n2\n');
+    expect(fs.readdirSync(privateTmp)).toEqual([]);
+  });
+
+  it.each(['malformed', 'diagnostic', 'malformed-timeout', 'diagnostic-timeout', 'external-kill'])
+  ('does not split a batch after a %s scanner failure', async failure => {
+    const log = path.join(root, 'timeout-ineligible-calls');
+    const privateTmp = path.join(root, 'timeout-ineligible-tmp');
+    fs.mkdirSync(privateTmp);
+    process.env.TMPDIR = privateTmp;
+    scannerProbe(`const fs = require('node:fs');
+      ${batchProbeReader}
+      fs.appendFileSync(${JSON.stringify(log)}, recordsForProbe().length + '\\n');
+      const failure = ${JSON.stringify(failure)};
+      if (failure === 'external-kill') process.kill(process.pid, 'SIGKILL');
+      else {
+        if (failure.startsWith('malformed')) process.stdout.write('{');
+        else process.stderr.write('private fixture diagnostic');
+        if (failure.endsWith('-timeout')) setInterval(() => {}, 1000);
+        else { if (failure === 'diagnostic') process.stdout.write('[]'); process.exit(0); }
+      }`);
+    const configured = JSON.parse(fs.readFileSync(path.join(root, 'record-exclusions.json'), 'utf8'));
+    policy({ ...configured.screening, timeout_ms: 2000 });
+    fs.writeFileSync(source, ['safe zero', 'safe one'].map(message => JSON.stringify({ message })).join('\n') + '\n');
+
+    await expect(readAdmittedConversation(source)).rejects.toThrow('Record screening unavailable');
+    expect(fs.readFileSync(log, 'utf8')).toBe('2\n');
+    expect(fs.readdirSync(privateTmp)).toEqual([]);
+  });
+
+  it.each([1, 3])('stops at the first hung singleton in a %i-record timeout recovery', async count => {
+    const log = path.join(root, 'timeout-hung-calls');
+    const privateTmp = path.join(root, 'timeout-hung-tmp');
+    fs.mkdirSync(privateTmp);
+    process.env.TMPDIR = privateTmp;
+    scannerProbe(`const fs = require('node:fs');
+      ${batchProbeReader}
+      fs.appendFileSync(${JSON.stringify(log)}, recordsForProbe().length + '\\n');
+      setInterval(() => {}, 1000);`);
+    const configured = JSON.parse(fs.readFileSync(path.join(root, 'record-exclusions.json'), 'utf8'));
+    policy({ ...configured.screening, timeout_ms: 2000 });
+    fs.writeFileSync(source, Array.from({ length: count }, (_, index) => JSON.stringify({ message: `safe ${index}` }))
+      .join('\n') + '\n');
+    const start = performance.now();
+
+    await expect(readAdmittedConversation(source)).rejects.toThrow('Record screening unavailable');
+    expect(fs.readFileSync(log, 'utf8')).toBe(count === 1 ? '1\n' : '3\n1\n');
+    expect(performance.now() - start).toBeLessThan(6000);
+    expect(fs.readdirSync(privateTmp)).toEqual([]);
+  });
+
+  it.each(['archive', 'scanner', 'source', 'policy'])
+  ('does not recover a timed-out batch after %s mutation', async mutation => {
+    const log = path.join(root, 'timeout-mutated-calls');
+    const privateTmp = path.join(root, 'timeout-mutated-tmp');
+    fs.mkdirSync(privateTmp);
+    process.env.TMPDIR = privateTmp;
+    const file = mutation === 'source' ? source : mutation === 'policy' ? path.join(root, 'record-exclusions.json') : null;
+    scannerProbe(`const fs = require('node:fs');
+      ${batchProbeReader}
+      fs.appendFileSync(${JSON.stringify(log)}, recordsForProbe().length + '\\n');
+      const mutation = ${JSON.stringify(mutation)};
+      fs.appendFileSync(mutation === 'archive' ? target : mutation === 'scanner' ? __filename : ${JSON.stringify(file)}, '\\n');
+      setInterval(() => {}, 1000);`);
+    const configured = JSON.parse(fs.readFileSync(path.join(root, 'record-exclusions.json'), 'utf8'));
+    policy({ ...configured.screening, timeout_ms: 2000 });
+    fs.writeFileSync(source, ['safe zero', 'safe one'].map(message => JSON.stringify({ message })).join('\n') + '\n');
+
+    await expect(readAdmittedConversation(source)).rejects.toThrow(mutation === 'source'
+      ? 'Conversation changed during record admission' : mutation === 'policy'
+        ? 'Record exclusion policy changed during record admission' : 'Record screening unavailable');
+    expect(fs.readFileSync(log, 'utf8')).toBe('2\n');
+    expect(fs.readdirSync(privateTmp)).toEqual([]);
   });
 
   it('rejects non-executable and symlink scanner identities', () => {

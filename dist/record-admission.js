@@ -354,7 +354,7 @@ async function packScreeningRecords(inputs) {
     return { bytes, names };
 }
 /** One pinned, short-lived local scanner context; no secret-bearing cache. */
-function createRecordScreener(policy) {
+function createRecordScreener(policy, checkAdmission = () => { }) {
     const config = policy?.screening;
     if (!config)
         return { scan() { }, async scanMany() { }, close() { } };
@@ -452,7 +452,9 @@ function createRecordScreener(policy) {
         validate(result.status, result.signal, result.stdout, !!result.error);
     };
     const scanInputAsync = async (inputs, signal) => {
+        checkAdmission();
         const { bytes, names } = await packScreeningRecords(inputs);
+        checkAdmission();
         const archive = path.join(directory, 'batch.tar');
         fs.writeFileSync(archive, bytes, { mode: 0o600, flag: 'wx' });
         const initialArchive = fs.lstatSync(archive);
@@ -479,13 +481,20 @@ function createRecordScreener(policy) {
             directoryArgs[directoryArgs.indexOf('--log-level') + 1] = 'warn';
             const child = spawn(config.executable, directoryArgs, {
                 cwd: directory, shell: false, env: environment,
-                timeout: config.timeout_ms, killSignal: 'SIGKILL', signal, windowsHide: true,
+                killSignal: 'SIGKILL', signal, windowsHide: true,
                 stdio: ['pipe', 'pipe', 'pipe'],
             });
             let stdout = '';
             let stdoutBytes = 0;
             let stderrBytes = 0;
             let failed = false;
+            let timerKilled = false;
+            const deadline = setTimeout(() => {
+                if (!failed && !signal.aborted && child.exitCode === null && child.signalCode === null) {
+                    timerKilled = child.kill('SIGKILL');
+                }
+            }, config.timeout_ms);
+            child.once('exit', () => clearTimeout(deadline));
             child.stdout.on('data', (chunk) => {
                 stdoutBytes += chunk.length;
                 if (stdoutBytes > SCANNER_OUTPUT_LIMIT) {
@@ -505,15 +514,22 @@ function createRecordScreener(policy) {
             });
             child.stdin.on('error', () => { failed = true; child.kill('SIGKILL'); });
             child.on('error', () => { failed = true; });
-            child.on('close', (status, signal) => {
+            child.on('close', (status, closedSignal) => {
+                clearTimeout(deadline);
                 try {
                     unchanged();
                     assertRecords();
+                    checkAdmission();
+                    if (timerKilled && closedSignal === 'SIGKILL' && !failed && !signal.aborted &&
+                        stdoutBytes === 0 && stderrBytes === 0) {
+                        reject(scannerTimeout);
+                        return;
+                    }
                     // The native directory walker can skip a failed input with a warning.
                     // A clean report with diagnostics is not a complete clean batch.
                     if (status === 0 && stderrBytes !== 0)
                         throw unavailable();
-                    validate(status, signal, stdout, failed, new Set(names.map(name => `batch.tar!${name}`)));
+                    validate(status, closedSignal, stdout, failed, new Set(names.map(name => `batch.tar!${name}`)));
                     resolve();
                 }
                 catch (error) {
@@ -525,6 +541,23 @@ function createRecordScreener(policy) {
             });
             child.stdin.end();
         });
+    };
+    const scannerTimeout = Symbol('scanner timeout');
+    const scanWithTimeoutRecovery = async (inputs, signal) => {
+        try {
+            await scanInputAsync(inputs, signal);
+        }
+        catch (error) {
+            if (error !== scannerTimeout)
+                throw error;
+            if (inputs.length < 2)
+                throw unavailable();
+            // A smaller container changes the timed-out work, not record boundaries.
+            // Both halves stay inside the caller's slot and must pass independently.
+            const midpoint = Math.floor(inputs.length / 2);
+            await scanWithTimeoutRecovery(inputs.slice(0, midpoint), signal);
+            await scanWithTimeoutRecovery(inputs.slice(midpoint), signal);
+        }
     };
     return {
         scan(value) {
@@ -542,7 +575,7 @@ function createRecordScreener(policy) {
                     return;
                 const release = await acquireScannerSlot(cancellation.signal);
                 try {
-                    await scanInputAsync(batch, cancellation.signal);
+                    await scanWithTimeoutRecovery(batch, cancellation.signal);
                 }
                 finally {
                     release();
@@ -671,7 +704,10 @@ function openRecordAdmission(file, policy) {
         assertUnchangedInput(file, initial);
         checkPolicy();
         if (!excluded)
-            screener = createRecordScreener(policy);
+            screener = createRecordScreener(policy, () => {
+                assertUnchangedInput(file, initial);
+                checkPolicy();
+            });
     }
     catch (error) {
         fs.closeSync(input);

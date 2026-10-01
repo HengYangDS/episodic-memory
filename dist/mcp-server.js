@@ -35353,7 +35353,8 @@ async function packScreeningRecords(inputs) {
   });
   return { bytes, names };
 }
-function createRecordScreener(policy) {
+function createRecordScreener(policy, checkAdmission = () => {
+}) {
   const config2 = policy?.screening;
   if (!config2) return { scan() {
   }, async scanMany() {
@@ -35453,7 +35454,9 @@ function createRecordScreener(policy) {
     validate2(result.status, result.signal, result.stdout, !!result.error);
   };
   const scanInputAsync = async (inputs, signal) => {
+    checkAdmission();
     const { bytes, names } = await packScreeningRecords(inputs);
+    checkAdmission();
     const archive = path2.join(directory, "batch.tar");
     fs2.writeFileSync(archive, bytes, { mode: 384, flag: "wx" });
     const initialArchive = fs2.lstatSync(archive);
@@ -35475,7 +35478,6 @@ function createRecordScreener(policy) {
         cwd: directory,
         shell: false,
         env: environment,
-        timeout: config2.timeout_ms,
         killSignal: "SIGKILL",
         signal,
         windowsHide: true,
@@ -35485,6 +35487,13 @@ function createRecordScreener(policy) {
       let stdoutBytes = 0;
       let stderrBytes = 0;
       let failed = false;
+      let timerKilled = false;
+      const deadline = setTimeout(() => {
+        if (!failed && !signal.aborted && child.exitCode === null && child.signalCode === null) {
+          timerKilled = child.kill("SIGKILL");
+        }
+      }, config2.timeout_ms);
+      child.once("exit", () => clearTimeout(deadline));
       child.stdout.on("data", (chunk) => {
         stdoutBytes += chunk.length;
         if (stdoutBytes > SCANNER_OUTPUT_LIMIT) {
@@ -35508,14 +35517,20 @@ function createRecordScreener(policy) {
       child.on("error", () => {
         failed = true;
       });
-      child.on("close", (status, signal2) => {
+      child.on("close", (status, closedSignal) => {
+        clearTimeout(deadline);
         try {
           unchanged();
           assertRecords();
+          checkAdmission();
+          if (timerKilled && closedSignal === "SIGKILL" && !failed && !signal.aborted && stdoutBytes === 0 && stderrBytes === 0) {
+            reject(scannerTimeout);
+            return;
+          }
           if (status === 0 && stderrBytes !== 0) throw unavailable();
           validate2(
             status,
-            signal2,
+            closedSignal,
             stdout,
             failed,
             new Set(names.map((name) => `batch.tar!${name}`))
@@ -35529,6 +35544,18 @@ function createRecordScreener(policy) {
       });
       child.stdin.end();
     });
+  };
+  const scannerTimeout = /* @__PURE__ */ Symbol("scanner timeout");
+  const scanWithTimeoutRecovery = async (inputs, signal) => {
+    try {
+      await scanInputAsync(inputs, signal);
+    } catch (error61) {
+      if (error61 !== scannerTimeout) throw error61;
+      if (inputs.length < 2) throw unavailable();
+      const midpoint = Math.floor(inputs.length / 2);
+      await scanWithTimeoutRecovery(inputs.slice(0, midpoint), signal);
+      await scanWithTimeoutRecovery(inputs.slice(midpoint), signal);
+    }
   };
   return {
     scan(value) {
@@ -35544,7 +35571,7 @@ function createRecordScreener(policy) {
         if (batch.length === 0) return;
         const release = await acquireScannerSlot(cancellation.signal);
         try {
-          await scanInputAsync(batch, cancellation.signal);
+          await scanWithTimeoutRecovery(batch, cancellation.signal);
         } finally {
           release();
         }
@@ -35645,7 +35672,10 @@ function openRecordAdmission(file2, policy) {
     excluded = descriptorHasExclusionMarker(input2);
     assertUnchangedInput(file2, initial);
     checkPolicy();
-    if (!excluded) screener = createRecordScreener(policy);
+    if (!excluded) screener = createRecordScreener(policy, () => {
+      assertUnchangedInput(file2, initial);
+      checkPolicy();
+    });
   } catch (error61) {
     fs2.closeSync(input2);
     throw error61;
