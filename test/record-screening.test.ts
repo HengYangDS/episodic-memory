@@ -3,6 +3,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { createRequire } from 'node:module';
+import { Readable } from 'node:stream';
 import { spawnSync } from 'node:child_process';
 import {
   admitExchange,
@@ -71,6 +73,26 @@ function archivedTranscript(text: string, withSummary = false): string {
   return file;
 }
 
+// Decode only the controlled test TAR; production packing uses tar-stream.
+const batchProbeReader = `
+const target = process.argv[2] === 'dir' ? process.argv.at(-1) : null;
+function recordsForProbe() {
+  if (!target) return [{ name: '', text: fs.readFileSync(0, 'utf8'), mode: 0o600 }];
+  const bytes = fs.readFileSync(target);
+  const records = [];
+  let offset = 0;
+  while (offset + 512 <= bytes.length && bytes[offset] !== 0) {
+    const header = bytes.subarray(offset, offset + 512);
+    const name = header.subarray(0, 100).toString('utf8').split('\\0')[0];
+    const size = parseInt(header.subarray(124, 136).toString('ascii').replace(/\\0/g, '').trim(), 8);
+    const mode = parseInt(header.subarray(100, 108).toString('ascii').replace(/\\0/g, '').trim(), 8);
+    records.push({ name, mode, text: bytes.subarray(offset + 512, offset + 512 + size).toString('utf8') });
+    offset += 512 + Math.ceil(size / 512) * 512;
+  }
+  return records;
+}
+`;
+
 // Contract probes are executable and digest-pinned without requiring Gitleaks
 // on every CI host. A separate optional integration test exercises Gitleaks.
 function scannerProbe(body: string): string {
@@ -89,10 +111,14 @@ beforeEach(() => {
   scanner = path.join(root, 'scanner-fixture');
   fs.writeFileSync(scanner, `#!${process.execPath}
 const fs = require('node:fs');
-const input = fs.readFileSync(0, 'utf8');
-const found = input.includes('ghp_') || /api_key\\s*=\\s*\\S{20}/i.test(input) ||
-  (input.includes('Sourcegraph') && /[a-f0-9]{40}/i.test(input));
-process.stdout.write(found ? '[{"RuleID":"fixture"}]' : '[]');
+${batchProbeReader}
+const foundRecord = recordsForProbe().find(record => {
+  const input = record.text;
+  return input.includes('ghp_') || /api_key\\s*=\\s*\\S{20}/i.test(input) ||
+    (input.includes('Sourcegraph') && /[a-f0-9]{40}/i.test(input));
+});
+const found = foundRecord !== undefined;
+process.stdout.write(found ? JSON.stringify([{ RuleID: 'fixture', File: target ? target + '!' + foundRecord.name : '' }]) : '[]');
 process.exit(found ? 10 : 0);
 `, { mode: 0o700 });
   scanner = fs.realpathSync(scanner);
@@ -191,7 +217,80 @@ describe('pinned record-local screening at native admission', () => {
     await expect(readAdmittedConversation(source)).rejects.toThrow(/content rejected by screening/i);
   });
 
-  it('screens separate records concurrently without crossing a bounded process limit', async () => {
+  it('screens a bounded batch in one process with private separate record files', async () => {
+    const log = path.join(root, 'batch-records.jsonl');
+    scannerProbe(`const fs = require('node:fs');
+      ${batchProbeReader}
+      const records = recordsForProbe();
+      fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify({
+        records: records.length, target,
+        modes: records.map(record => record.mode),
+        names: records.map(record => record.name),
+        independent: records.every(record => (record.text.match(/safe record/g) || []).length === 1),
+      }) + '\\n');
+      process.stdout.write('[]');`);
+    const lines = Array.from({ length: 24 }, (_, index) => JSON.stringify({
+      type: 'event_msg', payload: { type: 'user_message', message: `safe record ${index}` },
+    }));
+    fs.writeFileSync(source, lines.join('\n') + '\n');
+
+    expect(await readAdmittedConversation(source)).toBe(lines.join('\n'));
+    const calls = fs.readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({ records: 24, target: 'batch.tar', independent: true });
+    expect(calls[0].modes).toEqual(Array(24).fill(0o600));
+    expect(calls[0].names.every((name: string) => /^\d{8}\.txt$/.test(name))).toBe(true);
+  });
+
+  it('uses one private TAR container without extracting each batch record to disk', async () => {
+    const log = path.join(root, 'tar-contract');
+    scannerProbe(`const fs = require('node:fs');
+      const target = process.argv.at(-1);
+      const input = fs.readFileSync(target);
+      fs.writeFileSync(${JSON.stringify(log)}, JSON.stringify({ target,
+        files: fs.readdirSync('.'), mode: fs.statSync(target).mode & 0o777,
+        archiveDepth: process.argv[process.argv.indexOf('--max-archive-depth') + 1],
+        firstMember: input.subarray(0, 100).toString('utf8').replace(/\\0.*$/, ''),
+      }));
+      process.stdout.write('[]');`);
+    expect(await readAdmittedConversation(source)).toContain('safe question');
+    expect(JSON.parse(fs.readFileSync(log, 'utf8'))).toEqual({
+      target: 'batch.tar', files: ['batch.tar'], mode: 0o600,
+      archiveDepth: '1', firstMember: '00000000.txt',
+    });
+  });
+
+  it.each(['early-end', 'extra-trailer'])('rejects a noncanonical %s TAR before invoking the scanner', async mutation => {
+    const log = path.join(root, 'scanner-called');
+    scannerProbe(`require('node:fs').writeFileSync(${JSON.stringify(log)}, 'called'); process.stdout.write('[]');`);
+    const tar = createRequire(import.meta.url)('tar-stream');
+    const original = tar.pack;
+    const mocked = vi.spyOn(tar, 'pack').mockImplementation(() => {
+      const packed = original();
+      const output = new Readable({ read() {} }) as Readable & { entry: unknown; finalize: unknown };
+      output.entry = packed.entry.bind(packed);
+      output.finalize = packed.finalize.bind(packed);
+      const chunks: Buffer[] = [];
+      packed.on('data', (chunk: Buffer) => chunks.push(chunk));
+      packed.on('error', (error: Error) => output.destroy(error));
+      packed.on('end', () => {
+        const bytes = Buffer.concat(chunks);
+        const firstSize = parseInt(bytes.subarray(124, 136).toString('ascii'), 8);
+        const offset = 512 + Math.ceil(firstSize / 512) * 512;
+        output.push(mutation === 'early-end'
+          ? Buffer.concat([bytes.subarray(0, offset), Buffer.alloc(1024), bytes.subarray(offset)])
+          : Buffer.concat([bytes, Buffer.alloc(512)]));
+        output.push(null);
+      });
+      return output;
+    });
+    try {
+      await expect(readAdmittedConversation(source)).rejects.toThrow(/screening unavailable/i);
+      expect(fs.existsSync(log)).toBe(false);
+    } finally { mocked.mockRestore(); }
+  });
+
+  it('screens separate records in one process without crossing a bounded process limit', async () => {
     const log = path.join(root, 'scanner-events.jsonl');
     scannerProbe(`const fs = require('node:fs');
       fs.readFileSync(0);
@@ -216,10 +315,53 @@ describe('pinned record-local screening at native admission', () => {
       active += event.phase === 'start' ? 1 : -1;
       peak = Math.max(peak, active);
     }
-    expect(events).toHaveLength(16);
+    expect(events).toHaveLength(2);
     expect(active).toBe(0);
-    expect(peak).toBeGreaterThan(1);
+    expect(peak).toBe(1);
     expect(peak).toBeLessThanOrEqual(4);
+  });
+
+  it('bounds a directory process to 1024 record files', async () => {
+    const log = path.join(root, 'batch-counts');
+    scannerProbe(`const fs = require('node:fs');
+      ${batchProbeReader}
+      fs.appendFileSync(${JSON.stringify(log)}, recordsForProbe().length + '\\n');
+      process.stdout.write('[]');`);
+    const lines = Array.from({ length: 1025 }, (_, index) => JSON.stringify({ message: `safe ${index}` }));
+    fs.writeFileSync(source, lines.join('\n') + '\n');
+    expect(await readAdmittedConversation(source)).toBe(lines.join('\n'));
+    expect(fs.readFileSync(log, 'utf8')).toBe('1024\n1\n');
+  });
+
+  it.each(['delete', 'replace', 'chmod', 'diagnostic', 'unknown-finding'])
+  ('fails closed after a %s directory scanner result and removes staged records', async mode => {
+    const privateTmp = path.join(root, 'scanner-tmp');
+    fs.mkdirSync(privateTmp);
+    process.env.TMPDIR = privateTmp;
+    scannerProbe(`const fs = require('node:fs');
+      const path = require('node:path');
+      const target = process.argv.at(-1);
+      const file = target;
+      const mode = ${JSON.stringify(mode)};
+      if (mode === 'delete') fs.unlinkSync(file);
+      if (mode === 'replace') { const bytes = fs.readFileSync(file); fs.renameSync(file, file + '.old'); fs.writeFileSync(file, bytes); }
+      if (mode === 'chmod') fs.chmodSync(file, 0o644);
+      if (mode === 'diagnostic') process.stderr.write('private warning');
+      process.stdout.write(mode === 'unknown-finding' ? '[{"RuleID":"fixture","File":"foreign.txt"}]' : '[]');
+      process.exit(mode === 'unknown-finding' ? 10 : 0);`);
+    await expect(readAdmittedConversation(source)).rejects.toThrow(/screening unavailable/i);
+    expect(fs.readdirSync(privateTmp)).toEqual([]);
+  });
+
+  it.skipIf(!realScannerPath)('keeps real Gitleaks directory screening record-local', async () => {
+    const executable = fs.realpathSync(realScannerPath!);
+    policy({ executable, sha256: crypto.createHash('sha256').update(fs.readFileSync(executable)).digest('hex') });
+    const lines = ['Sourcegraph', '0123456789abcdef0123456789abcdef01234567']
+      .map(message => JSON.stringify({ type: 'event_msg', payload: { message } }));
+    fs.writeFileSync(source, lines.join('\n') + '\n');
+    expect(await readAdmittedConversation(source)).toBe(lines.join('\n'));
+    fs.writeFileSync(source, transcript(token));
+    await expect(readAdmittedConversation(source)).rejects.toThrow(/content rejected by screening/i);
   });
 
   it('flushes large screened records before the aggregate batch exceeds its byte cap', async () => {
@@ -277,7 +419,7 @@ describe('pinned record-local screening at native admission', () => {
       active += event.phase === 'start' ? 1 : -1;
       peak = Math.max(peak, active);
     }
-    expect(events).toHaveLength(32);
+    expect(events).toHaveLength(4);
     expect(active).toBe(0);
     expect(peak).toBeGreaterThan(1);
     expect(peak).toBeLessThanOrEqual(4);
@@ -296,7 +438,7 @@ describe('pinned record-local screening at native admission', () => {
     const lines = Array.from({ length: 8 }, (_, index) => JSON.stringify({ message: `safe ${index}` }));
     fs.writeFileSync(source, lines.join('\n') + '\n');
 
-    const pending = readAdmittedConversation(source);
+    const pending = Promise.all(Array.from({ length: 3 }, () => readAdmittedConversation(source)));
     const deadline = performance.now() + 3000;
     while ((!fs.existsSync(log) || fs.readFileSync(log, 'utf8').split('\n').filter(line => line.includes('start')).length < 3) &&
       performance.now() < deadline) {
@@ -305,7 +447,7 @@ describe('pinned record-local screening at native admission', () => {
     expect(fs.existsSync(log)).toBe(true);
     await new Promise(resolve => setTimeout(resolve, 30));
     expect(admitExchange(exchange())).toEqual(exchange());
-    expect(await pending).toBe(lines.join('\n'));
+    expect(await pending).toEqual(Array(3).fill(lines.join('\n')));
 
     const events = fs.readFileSync(log, 'utf8').trim().split('\n')
       .map(line => JSON.parse(line) as { phase: string; time: string })
@@ -316,7 +458,7 @@ describe('pinned record-local screening at native admission', () => {
       active += event.phase === 'start' ? 1 : -1;
       peak = Math.max(peak, active);
     }
-    expect(events).toHaveLength(22);
+    expect(events).toHaveLength(12);
     expect(active).toBe(0);
     expect(peak).toBeLessThanOrEqual(4);
   });
@@ -341,7 +483,7 @@ describe('pinned record-local screening at native admission', () => {
     fs.writeFileSync(source, lines.join('\n') + '\n');
 
     await parseConversation(source, 'fixture', source);
-    expect(fs.readFileSync(log, 'utf8').length).toBe(lines.length + 1);
+    expect(fs.readFileSync(log, 'utf8').length).toBe(2);
   });
 
   it('removes a partial derived archive when a later screening batch rejects content', async () => {
@@ -387,11 +529,27 @@ describe('pinned record-local screening at native admission', () => {
     }
   });
 
-  it('aborts in-flight record scanners after the first rejection', async () => {
+  it('reuses one validated policy snapshot across many unchanged stream chunks', async () => {
+    const policyFile = path.join(root, 'record-exclusions.json');
+    fs.writeFileSync(policyFile, JSON.stringify({ version: 1, exchanges: [], tool_calls: [] }));
+    const lines = Array.from({ length: 300 }, (_, index) => JSON.stringify({
+      type: 'event_msg', payload: { message: `safe ${index} ` + 'x'.repeat(4000) },
+    }));
+    fs.writeFileSync(source, lines.join('\n') + '\n');
+    const opened = vi.spyOn(fs, 'openSync');
+    try {
+      expect(await readAdmittedConversation(source)).toBe(lines.join('\n'));
+      expect(opened.mock.calls.filter(([file]) => file === policyFile).length).toBeLessThanOrEqual(6);
+    } finally { opened.mockRestore(); }
+  });
+
+  it('rejects a directory batch without publishing its safe neighbors', async () => {
     scannerProbe(`const fs = require('node:fs');
-      const input = fs.readFileSync(0, 'utf8');
-      if (input.includes('reject-me')) {
-        process.stdout.write('[{"RuleID":"fixture"}]'); process.exit(10);
+      const path = require('node:path');
+      ${batchProbeReader}
+      const found = recordsForProbe().find(record => record.text.includes('reject-me'));
+      if (found !== undefined) {
+        process.stdout.write(JSON.stringify([{ RuleID: 'fixture', File: target ? target + '!' + found.name : '' }])); process.exit(10);
       }
       setInterval(() => {}, 1000);`);
     const configured = JSON.parse(fs.readFileSync(path.join(root, 'record-exclusions.json'), 'utf8'));

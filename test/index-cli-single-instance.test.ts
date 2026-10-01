@@ -231,6 +231,17 @@ describe('index-cli single-instance lock (#97)', () => {
     expect(existsSync(join(testDir, 'archive', 'project', 'sibling.jsonl'))).toBe(false);
   });
 
+  it('refuses an unknown public command before any index work', () => {
+    const result = spawnSync(process.execPath, [PUBLIC_CLI, 'verify-page', '--max-files', '1'], {
+      env: { ...process.env, ...envOverrides }, encoding: 'utf8', timeout: 20_000,
+    });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('Unknown index command: verify-page');
+    expect(result.stdout).not.toMatch(/Initializing database|Loading embedding|Scanning/i);
+    expect(existsSync(join(testDir, 'test.db'))).toBe(false);
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
   it('accepts an explicit byte ceiling for exact-path indexing', () => {
     const project = join(testDir, 'projects', 'project');
     mkdirSync(project, { recursive: true });

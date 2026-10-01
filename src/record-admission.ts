@@ -2,6 +2,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import os from 'node:os';
+import { createRequire } from 'node:module';
+import { Readable, Writable } from 'node:stream';
 import { spawn, spawnSync } from 'node:child_process';
 import { SUMMARIZER_CONTEXT_MARKER } from './constants.js';
 import type { ConversationExchange } from './types.js';
@@ -14,7 +16,7 @@ const EXCLUSION_MARKERS = [
 ];
 
 const MARKER_SCAN_CHUNK_BYTES = 1 << 20; // 1 MiB
-const SCREENING_BATCH_RECORDS = 16;
+const SCREENING_BATCH_RECORDS = 1024;
 const SCREENING_BATCH_BYTES = 8 * 1024 * 1024;
 const SCREENING_PARALLELISM = 4;
 // spawnSync blocks the event loop, so at most one synchronous scanner can run
@@ -165,10 +167,29 @@ function assertUnchangedSearchPrefix(file: string, initial: fs.Stats, expectedDi
   finally { if (fd !== undefined) fs.closeSync(fd); }
 }
 
+function policyGuard(expected: string): () => void {
+  const file = path.join(getSuperpowersDir(), 'record-exclusions.json');
+  const changed = () => new Error('Record exclusion policy changed during record admission');
+  let identity: fs.Stats | undefined;
+  try { identity = fs.lstatSync(file); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw changed(); }
+  if (JSON.stringify(readRecordExclusions()) !== expected) throw changed();
+  const guard = () => {
+    let current: fs.Stats | undefined;
+    try { current = fs.lstatSync(file); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw changed(); }
+    if (!identity && !current) return;
+    if (!identity || !current || !current.isFile() || current.isSymbolicLink() ||
+        identity.dev !== current.dev || identity.ino !== current.ino || identity.size !== current.size ||
+        identity.mtimeMs !== current.mtimeMs || identity.ctimeMs !== current.ctimeMs ||
+        identity.uid !== current.uid || identity.mode !== current.mode) throw changed();
+  };
+  guard();
+  return guard;
+}
+
 function assertUnchangedPolicy(expected: string): void {
-  if (JSON.stringify(readRecordExclusions()) !== expected) {
-    throw new Error('Record exclusion policy changed during record admission');
-  }
+  policyGuard(expected)();
 }
 
 function prepareArchiveParent(directory: string): string {
@@ -250,6 +271,86 @@ function screeningText(value: unknown, depth = 0): string {
   return value == null ? '' : String(value);
 }
 
+/** Package independent record members with the existing locked TAR library. */
+async function packScreeningRecords(inputs: string[]): Promise<{ bytes: Buffer; names: string[] }> {
+  const tar = createRequire(import.meta.url)('tar-stream') as {
+    pack(): Readable & { entry(header: object, data: Buffer): void; finalize(): void };
+    extract(): Writable;
+  };
+  const names = inputs.map((_, index) => `${index.toString().padStart(8, '0')}.txt`);
+  const maximumBytes = SCREENING_BATCH_BYTES + SCREENING_BATCH_RECORDS * 1024 + 1024;
+  const pack = tar.pack();
+  const chunks: Buffer[] = [];
+  let total = 0;
+  const packed = new Promise<Buffer>((resolve, reject) => {
+    pack.on('data', (chunk: Buffer) => {
+      total += chunk.length;
+      if (total > maximumBytes) pack.destroy(new Error('Record screening byte limit exceeded'));
+      else chunks.push(chunk);
+    });
+    pack.on('error', reject);
+    pack.on('end', () => resolve(Buffer.concat(chunks)));
+  });
+  for (let index = 0; index < inputs.length; index++) {
+    const data = Buffer.from(inputs[index]);
+    pack.entry({ name: names[index], size: data.length, type: 'file', mode: 0o600,
+      uid: 0, gid: 0, mtime: new Date(0) }, data);
+  }
+  pack.finalize();
+  const bytes = await packed;
+  // The JS extractor skips zero headers; the native scanner stops at the first
+  // TAR end marker. Require canonical framing as well as decoded member data.
+  let offset = 0;
+  for (let index = 0; index < inputs.length; index++) {
+    const header = bytes.subarray(offset, offset + 512);
+    const name = Buffer.alloc(100);
+    name.write(names[index]);
+    if (header.length !== 512 || !header.subarray(0, 100).equals(name) ||
+        header[156] !== 48 || !header.subarray(157, 257).equals(Buffer.alloc(100)) ||
+        !header.subarray(345, 500).equals(Buffer.alloc(155))) {
+      throw new Error('Record screening unavailable');
+    }
+    offset += 512 + Math.ceil(Buffer.byteLength(inputs[index]) / 512) * 512;
+  }
+  if (bytes.length !== offset + 1024 || !bytes.subarray(offset).equals(Buffer.alloc(1024))) {
+    throw new Error('Record screening unavailable');
+  }
+  // Validate the complete serialized container before the native scanner sees
+  // it. An early TAR terminator must not turn omitted records into clean input.
+  const extract = tar.extract();
+  let index = 0;
+  await new Promise<void>((resolve, reject) => {
+    extract.on('entry', (header: { name: string; size: number; type: string; mode: number },
+      stream: Readable, next: () => void) => {
+      const expected = inputs[index];
+      if (expected === undefined || header.name !== names[index] || header.type !== 'file' ||
+          header.mode !== 0o600 || header.size !== Buffer.byteLength(expected)) {
+        stream.resume();
+        extract.destroy(new Error('Record screening unavailable'));
+        return;
+      }
+      const data: Buffer[] = [];
+      stream.on('data', (chunk: Buffer) => data.push(chunk));
+      stream.on('error', reject);
+      stream.on('end', () => {
+        if (!Buffer.concat(data).equals(Buffer.from(expected))) {
+          extract.destroy(new Error('Record screening unavailable'));
+          return;
+        }
+        index++;
+        next();
+      });
+    });
+    extract.on('error', reject);
+    extract.on('finish', () => {
+      if (index !== inputs.length) reject(new Error('Record screening unavailable'));
+      else resolve();
+    });
+    extract.end(bytes);
+  });
+  return { bytes, names };
+}
+
 /** One pinned, short-lived local scanner context; no secret-bearing cache. */
 function createRecordScreener(policy: RecordExclusions | null): {
   scan(value: unknown): void;
@@ -292,7 +393,9 @@ function createRecordScreener(policy: RecordExclusions | null): {
     'stdin', '--redact', '--no-banner', '--log-level', 'error',
     '--ignore-gitleaks-allow', '--exit-code', '10', '--report-format', 'json', '--report-path', '-',
   ];
-  const environment = { HOME: directory, USERPROFILE: directory, PATH: path.dirname(config.executable) };
+  const environment = {
+    HOME: directory, USERPROFILE: directory, PATH: path.dirname(config.executable), GOMAXPROCS: '1',
+  };
   const prepare = (value: unknown): string | null => {
     const raw = typeof value === 'string' ? value : JSON.stringify(value);
     if (raw === undefined) return null;
@@ -302,12 +405,15 @@ function createRecordScreener(policy: RecordExclusions | null): {
     return input.trim() ? input : null;
   };
   const validate = (status: number | null | undefined, signal: string | null | undefined,
-    stdout: string, failed: boolean): void => {
+    stdout: string, failed: boolean, files?: Set<string>): void => {
     if (failed || signal || ![0, 10].includes(status ?? -1)) throw unavailable();
     let report: unknown;
     try { report = JSON.parse(stdout); } catch { throw unavailable(); }
     if (!Array.isArray(report) || (status === 0 && report.length !== 0) ||
         (status === 10 && (report.length === 0 || !report.every(item => object(item) && typeof item.RuleID === 'string')))) {
+      throw unavailable();
+    }
+    if (files && report.some(item => !object(item) || typeof item.File !== 'string' || !files.has(item.File))) {
       throw unavailable();
     }
     if (status === 10) throw new Error('Record content rejected by screening');
@@ -322,9 +428,29 @@ function createRecordScreener(policy: RecordExclusions | null): {
     unchanged();
     validate(result.status, result.signal, result.stdout, !!result.error);
   };
-  const scanInputAsync = (input: string, signal: AbortSignal): Promise<void> => new Promise((resolve, reject) => {
+  const scanInputAsync = async (inputs: string[], signal: AbortSignal): Promise<void> => {
+    const { bytes, names } = await packScreeningRecords(inputs);
+    const archive = path.join(directory, 'batch.tar');
+    fs.writeFileSync(archive, bytes, { mode: 0o600, flag: 'wx' });
+    const initialArchive = fs.lstatSync(archive);
+    return new Promise((resolve, reject) => {
+    const assertRecords = () => {
+      try {
+        const current = fs.lstatSync(archive);
+        const initial = initialArchive;
+        if (fs.readdirSync(directory).join('\n') !== 'batch.tar' || !current.isFile() ||
+            current.isSymbolicLink() || (current.mode & 0o777) !== 0o600 ||
+            current.uid !== initial.uid || current.gid !== initial.gid ||
+            current.dev !== initial.dev || current.ino !== initial.ino || current.size !== initial.size ||
+            current.mtimeMs !== initial.mtimeMs || current.ctimeMs !== initial.ctimeMs ||
+            !fs.readFileSync(archive).equals(bytes)) throw unavailable();
+      } catch { throw unavailable(); }
+    };
+    assertRecords();
     unchanged();
-    const child = spawn(config.executable, args, {
+    const directoryArgs = ['dir', ...args.slice(1), '--max-archive-depth', '1', 'batch.tar'];
+    directoryArgs[directoryArgs.indexOf('--log-level') + 1] = 'warn';
+    const child = spawn(config.executable, directoryArgs, {
       cwd: directory, shell: false, env: environment,
       timeout: config.timeout_ms, killSignal: 'SIGKILL', signal, windowsHide: true,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -354,41 +480,46 @@ function createRecordScreener(policy: RecordExclusions | null): {
     child.on('close', (status, signal) => {
       try {
         unchanged();
-        validate(status, signal, stdout, failed);
+        assertRecords();
+        // The native directory walker can skip a failed input with a warning.
+        // A clean report with diagnostics is not a complete clean batch.
+        if (status === 0 && stderrBytes !== 0) throw unavailable();
+        validate(status, signal, stdout, failed,
+          new Set(names.map(name => `batch.tar!${name}`)));
         resolve();
       } catch (error) { reject(error); }
+      finally { fs.rmSync(archive, { force: true }); }
     });
-    child.stdin.end(input);
-  });
+    child.stdin.end();
+    });
+  };
   return {
     scan(value: unknown) {
       const input = prepare(value);
       if (input !== null) scanInput(input);
     },
     async scanMany(values: unknown[]) {
-      const inputs = values.map(prepare);
+      const inputs = values.map(prepare).filter((input): input is string => input !== null);
       const cancellation = new AbortController();
-      let firstError: Error | undefined;
-      let next = 0;
-      await Promise.all(Array.from({ length: Math.min(ASYNC_SCREENING_PARALLELISM, inputs.length) }, async () => {
-        while (next < inputs.length && !firstError) {
-          const index = next++;
-          const input = inputs[index];
-          if (input === null) continue;
-          try {
-            const release = await acquireScannerSlot(cancellation.signal);
-            try { await scanInputAsync(input, cancellation.signal); }
-            finally { release(); }
-          }
-          catch (error) {
-            if (!firstError) {
-              firstError = error instanceof Error ? error : unavailable();
-              cancellation.abort();
-            }
-          }
+      let batch: string[] = [];
+      let bytes = 0;
+      const flush = async () => {
+        if (batch.length === 0) return;
+        const release = await acquireScannerSlot(cancellation.signal);
+        try { await scanInputAsync(batch, cancellation.signal); }
+        finally { release(); }
+        batch = [];
+        bytes = 0;
+      };
+      for (const input of inputs) {
+        const size = Buffer.byteLength(input);
+        if (batch.length > 0 && (bytes + size > SCREENING_BATCH_BYTES || batch.length === SCREENING_BATCH_RECORDS)) {
+          await flush();
         }
-      }));
-      if (firstError) throw firstError;
+        batch.push(input);
+        bytes += size;
+      }
+      await flush();
     },
     close() { fs.rmSync(directory, { recursive: true, force: true }); },
   };
@@ -481,7 +612,7 @@ async function* admittedRecords(file: string, policy: RecordExclusions | null, s
     throw new Error('Invalid record screening batch size');
   }
   const policySnapshot = JSON.stringify(policy);
-  assertUnchangedPolicy(policySnapshot);
+  const checkPolicy = policyGuard(policySnapshot);
   const input = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
   const initial = fs.fstatSync(input);
   let stream: fs.ReadStream | undefined;
@@ -516,7 +647,7 @@ async function* admittedRecords(file: string, policy: RecordExclusions | null, s
     if (policy?.screening) {
       await screener?.scanMany(batch.map(record => record.line));
       assertUnchangedInput(file, initial);
-      assertUnchangedPolicy(policySnapshot);
+      checkPolicy();
     }
     for (const record of batch) yield record;
     batch.length = 0;
@@ -531,7 +662,7 @@ async function* admittedRecords(file: string, policy: RecordExclusions | null, s
     stream = fs.createReadStream(file, { fd: input, autoClose: true, start: 0 });
     for await (const chunk of stream) {
       assertUnchangedInput(file, initial);
-      assertUnchangedPolicy(policySnapshot);
+      checkPolicy();
       pending = Buffer.concat([pending, chunk]);
       let newline: number;
       while ((newline = pending.indexOf(10)) !== -1) {
@@ -553,7 +684,7 @@ async function* admittedRecords(file: string, policy: RecordExclusions | null, s
     }
     yield* flush();
     assertUnchangedInput(file, initial);
-    assertUnchangedPolicy(policySnapshot);
+    checkPolicy();
   } finally {
     if (stream) stream.destroy();
     else fs.closeSync(input);
@@ -565,7 +696,6 @@ async function* admittedRecords(file: string, policy: RecordExclusions | null, s
 export async function* admittedConversationLines(file: string, policy = readRecordExclusions(),
   batchRecords = SCREENING_BATCH_RECORDS): AsyncGenerator<string> {
   if (!fs.lstatSync(file).isFile()) throw new Error('Conversation input must be a regular non-symlink file');
-  if (shouldSkipConversation(file)) return;
   for await (const record of admittedRecords(file, policy, 1, Infinity, batchRecords)) yield record.line;
 }
 

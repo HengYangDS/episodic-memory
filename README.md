@@ -594,13 +594,23 @@ Verification reports scanner rejections and scanner unavailability separately
 from transcript corruption, even when a summary is missing. A broad repair
 refuses to start while either screening failure remains.
 No findings, input, scanner diagnostics or secret fingerprints appear in errors.
-The scanner receives stdin in a private empty working directory with no inherited
-environment/configuration and with inline allow comments disabled. Its temporary
-directory is removed after execution. Original transcripts and previously
-published archives remain unchanged when admission fails.
+Synchronous admission sends one record through stdin. Streamed admission packs
+up to 1,024 independent records and 8 MiB of prepared payload into one private,
+uncompressed TAR container. The pinned scanner reads separate neutral `.txt`
+members through its native archive walker, not TAR bytes through stdin. The
+serializer validates canonical framing, complete member contents and the final
+end marker before scanning; container identity and bytes are checked afterward.
+Clean findings JSON alone is not an independent member-coverage attestation.
+No record members are extracted to disk. The `0600` container and `0700`
+directory are removed after execution. Scanner configuration/environment is
+isolated, inline allow comments are disabled, and original transcripts and
+previously published archives remain unchanged when admission fails.
 
-Screening launches a bounded subprocess per record; it is not an unbounded bulk
-collection service. Measure a finite representative batch before large imports.
+Screening keeps the configured per-record byte limit and process timeout. At
+most three asynchronous scanners run per server, reserving one slot for
+synchronous admission; a transcript flushes its batches sequentially. It is not
+an unbounded bulk collection service. Measure a finite representative batch
+before large imports, and give the complete caller its own wall-clock deadline.
 No automatic sync or background job is enabled by this setting. Before enabling
 it, replace all policy consumers with this version through their native lifecycle:
 older strict-schema consumers reject the additional field. Installing a plugin

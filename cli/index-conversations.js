@@ -153,7 +153,8 @@ async function main() {
         break;
 
       default:
-        await runScript('index-all', [command, ...args]);
+        console.error(`Unknown index command: ${command}. Run --help for supported options.`);
+        process.exitCode = 1;
         break;
     }
   } catch (error) {

@@ -35038,6 +35038,7 @@ import fs2 from "node:fs";
 import path2 from "node:path";
 import crypto from "node:crypto";
 import os2 from "node:os";
+import { createRequire } from "node:module";
 import { spawn, spawnSync } from "node:child_process";
 
 // src/constants.ts
@@ -35096,7 +35097,7 @@ var EXCLUSION_MARKERS = [
   SUMMARIZER_CONTEXT_MARKER
 ];
 var MARKER_SCAN_CHUNK_BYTES = 1 << 20;
-var SCREENING_BATCH_RECORDS = 16;
+var SCREENING_BATCH_RECORDS = 1024;
 var SCREENING_BATCH_BYTES = 8 * 1024 * 1024;
 var SCREENING_PARALLELISM = 4;
 var ASYNC_SCREENING_PARALLELISM = SCREENING_PARALLELISM - 1;
@@ -35218,10 +35219,31 @@ function assertUnchangedSearchPrefix(file2, initial, expectedDigest) {
     if (fd !== void 0) fs2.closeSync(fd);
   }
 }
-function assertUnchangedPolicy(expected) {
-  if (JSON.stringify(readRecordExclusions()) !== expected) {
-    throw new Error("Record exclusion policy changed during record admission");
+function policyGuard(expected) {
+  const file2 = path2.join(getSuperpowersDir(), "record-exclusions.json");
+  const changed = () => new Error("Record exclusion policy changed during record admission");
+  let identity2;
+  try {
+    identity2 = fs2.lstatSync(file2);
+  } catch (error61) {
+    if (error61.code !== "ENOENT") throw changed();
   }
+  if (JSON.stringify(readRecordExclusions()) !== expected) throw changed();
+  const guard = () => {
+    let current;
+    try {
+      current = fs2.lstatSync(file2);
+    } catch (error61) {
+      if (error61.code !== "ENOENT") throw changed();
+    }
+    if (!identity2 && !current) return;
+    if (!identity2 || !current || !current.isFile() || current.isSymbolicLink() || identity2.dev !== current.dev || identity2.ino !== current.ino || identity2.size !== current.size || identity2.mtimeMs !== current.mtimeMs || identity2.ctimeMs !== current.ctimeMs || identity2.uid !== current.uid || identity2.mode !== current.mode) throw changed();
+  };
+  guard();
+  return guard;
+}
+function assertUnchangedPolicy(expected) {
+  policyGuard(expected)();
 }
 var POLICY_ERROR = "Invalid or unreadable record exclusion policy";
 var UUID = /[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}/ig;
@@ -35256,6 +35278,80 @@ function screeningText(value, depth = 0) {
     return Object.entries(value).map(([key, item]) => `${key} = ${screeningText(item, depth + 1)}`).join("\n");
   }
   return value == null ? "" : String(value);
+}
+async function packScreeningRecords(inputs) {
+  const tar = createRequire(import.meta.url)("tar-stream");
+  const names = inputs.map((_2, index2) => `${index2.toString().padStart(8, "0")}.txt`);
+  const maximumBytes = SCREENING_BATCH_BYTES + SCREENING_BATCH_RECORDS * 1024 + 1024;
+  const pack = tar.pack();
+  const chunks = [];
+  let total = 0;
+  const packed = new Promise((resolve, reject) => {
+    pack.on("data", (chunk) => {
+      total += chunk.length;
+      if (total > maximumBytes) pack.destroy(new Error("Record screening byte limit exceeded"));
+      else chunks.push(chunk);
+    });
+    pack.on("error", reject);
+    pack.on("end", () => resolve(Buffer.concat(chunks)));
+  });
+  for (let index2 = 0; index2 < inputs.length; index2++) {
+    const data = Buffer.from(inputs[index2]);
+    pack.entry({
+      name: names[index2],
+      size: data.length,
+      type: "file",
+      mode: 384,
+      uid: 0,
+      gid: 0,
+      mtime: /* @__PURE__ */ new Date(0)
+    }, data);
+  }
+  pack.finalize();
+  const bytes = await packed;
+  let offset = 0;
+  for (let index2 = 0; index2 < inputs.length; index2++) {
+    const header = bytes.subarray(offset, offset + 512);
+    const name = Buffer.alloc(100);
+    name.write(names[index2]);
+    if (header.length !== 512 || !header.subarray(0, 100).equals(name) || header[156] !== 48 || !header.subarray(157, 257).equals(Buffer.alloc(100)) || !header.subarray(345, 500).equals(Buffer.alloc(155))) {
+      throw new Error("Record screening unavailable");
+    }
+    offset += 512 + Math.ceil(Buffer.byteLength(inputs[index2]) / 512) * 512;
+  }
+  if (bytes.length !== offset + 1024 || !bytes.subarray(offset).equals(Buffer.alloc(1024))) {
+    throw new Error("Record screening unavailable");
+  }
+  const extract = tar.extract();
+  let index = 0;
+  await new Promise((resolve, reject) => {
+    extract.on("entry", (header, stream, next) => {
+      const expected = inputs[index];
+      if (expected === void 0 || header.name !== names[index] || header.type !== "file" || header.mode !== 384 || header.size !== Buffer.byteLength(expected)) {
+        stream.resume();
+        extract.destroy(new Error("Record screening unavailable"));
+        return;
+      }
+      const data = [];
+      stream.on("data", (chunk) => data.push(chunk));
+      stream.on("error", reject);
+      stream.on("end", () => {
+        if (!Buffer.concat(data).equals(Buffer.from(expected))) {
+          extract.destroy(new Error("Record screening unavailable"));
+          return;
+        }
+        index++;
+        next();
+      });
+    });
+    extract.on("error", reject);
+    extract.on("finish", () => {
+      if (index !== inputs.length) reject(new Error("Record screening unavailable"));
+      else resolve();
+    });
+    extract.end(bytes);
+  });
+  return { bytes, names };
 }
 function createRecordScreener(policy) {
   const config2 = policy?.screening;
@@ -35310,7 +35406,12 @@ function createRecordScreener(policy) {
     "--report-path",
     "-"
   ];
-  const environment = { HOME: directory, USERPROFILE: directory, PATH: path2.dirname(config2.executable) };
+  const environment = {
+    HOME: directory,
+    USERPROFILE: directory,
+    PATH: path2.dirname(config2.executable),
+    GOMAXPROCS: "1"
+  };
   const prepare = (value) => {
     const raw = typeof value === "string" ? value : JSON.stringify(value);
     if (raw === void 0) return null;
@@ -35319,7 +35420,7 @@ function createRecordScreener(policy) {
     if (Buffer.byteLength(input2) > config2.max_record_bytes) throw new Error("Record screening byte limit exceeded");
     return input2.trim() ? input2 : null;
   };
-  const validate2 = (status, signal, stdout, failed) => {
+  const validate2 = (status, signal, stdout, failed, files) => {
     if (failed || signal || ![0, 10].includes(status ?? -1)) throw unavailable();
     let report;
     try {
@@ -35328,6 +35429,9 @@ function createRecordScreener(policy) {
       throw unavailable();
     }
     if (!Array.isArray(report) || status === 0 && report.length !== 0 || status === 10 && (report.length === 0 || !report.every((item) => object3(item) && typeof item.RuleID === "string"))) {
+      throw unavailable();
+    }
+    if (files && report.some((item) => !object3(item) || typeof item.File !== "string" || !files.has(item.File))) {
       throw unavailable();
     }
     if (status === 10) throw new Error("Record content rejected by screening");
@@ -35348,87 +35452,114 @@ function createRecordScreener(policy) {
     unchanged();
     validate2(result.status, result.signal, result.stdout, !!result.error);
   };
-  const scanInputAsync = (input2, signal) => new Promise((resolve, reject) => {
-    unchanged();
-    const child = spawn(config2.executable, args, {
-      cwd: directory,
-      shell: false,
-      env: environment,
-      timeout: config2.timeout_ms,
-      killSignal: "SIGKILL",
-      signal,
-      windowsHide: true,
-      stdio: ["pipe", "pipe", "pipe"]
-    });
-    let stdout = "";
-    let stdoutBytes = 0;
-    let stderrBytes = 0;
-    let failed = false;
-    child.stdout.on("data", (chunk) => {
-      stdoutBytes += chunk.length;
-      if (stdoutBytes > SCANNER_OUTPUT_LIMIT) {
+  const scanInputAsync = async (inputs, signal) => {
+    const { bytes, names } = await packScreeningRecords(inputs);
+    const archive = path2.join(directory, "batch.tar");
+    fs2.writeFileSync(archive, bytes, { mode: 384, flag: "wx" });
+    const initialArchive = fs2.lstatSync(archive);
+    return new Promise((resolve, reject) => {
+      const assertRecords = () => {
+        try {
+          const current = fs2.lstatSync(archive);
+          const initial2 = initialArchive;
+          if (fs2.readdirSync(directory).join("\n") !== "batch.tar" || !current.isFile() || current.isSymbolicLink() || (current.mode & 511) !== 384 || current.uid !== initial2.uid || current.gid !== initial2.gid || current.dev !== initial2.dev || current.ino !== initial2.ino || current.size !== initial2.size || current.mtimeMs !== initial2.mtimeMs || current.ctimeMs !== initial2.ctimeMs || !fs2.readFileSync(archive).equals(bytes)) throw unavailable();
+        } catch {
+          throw unavailable();
+        }
+      };
+      assertRecords();
+      unchanged();
+      const directoryArgs = ["dir", ...args.slice(1), "--max-archive-depth", "1", "batch.tar"];
+      directoryArgs[directoryArgs.indexOf("--log-level") + 1] = "warn";
+      const child = spawn(config2.executable, directoryArgs, {
+        cwd: directory,
+        shell: false,
+        env: environment,
+        timeout: config2.timeout_ms,
+        killSignal: "SIGKILL",
+        signal,
+        windowsHide: true,
+        stdio: ["pipe", "pipe", "pipe"]
+      });
+      let stdout = "";
+      let stdoutBytes = 0;
+      let stderrBytes = 0;
+      let failed = false;
+      child.stdout.on("data", (chunk) => {
+        stdoutBytes += chunk.length;
+        if (stdoutBytes > SCANNER_OUTPUT_LIMIT) {
+          failed = true;
+          child.kill("SIGKILL");
+        } else {
+          stdout += chunk.toString("utf8");
+        }
+      });
+      child.stderr.on("data", (chunk) => {
+        stderrBytes += chunk.length;
+        if (stderrBytes > SCANNER_OUTPUT_LIMIT) {
+          failed = true;
+          child.kill("SIGKILL");
+        }
+      });
+      child.stdin.on("error", () => {
         failed = true;
         child.kill("SIGKILL");
-      } else {
-        stdout += chunk.toString("utf8");
-      }
-    });
-    child.stderr.on("data", (chunk) => {
-      stderrBytes += chunk.length;
-      if (stderrBytes > SCANNER_OUTPUT_LIMIT) {
+      });
+      child.on("error", () => {
         failed = true;
-        child.kill("SIGKILL");
-      }
+      });
+      child.on("close", (status, signal2) => {
+        try {
+          unchanged();
+          assertRecords();
+          if (status === 0 && stderrBytes !== 0) throw unavailable();
+          validate2(
+            status,
+            signal2,
+            stdout,
+            failed,
+            new Set(names.map((name) => `batch.tar!${name}`))
+          );
+          resolve();
+        } catch (error61) {
+          reject(error61);
+        } finally {
+          fs2.rmSync(archive, { force: true });
+        }
+      });
+      child.stdin.end();
     });
-    child.stdin.on("error", () => {
-      failed = true;
-      child.kill("SIGKILL");
-    });
-    child.on("error", () => {
-      failed = true;
-    });
-    child.on("close", (status, signal2) => {
-      try {
-        unchanged();
-        validate2(status, signal2, stdout, failed);
-        resolve();
-      } catch (error61) {
-        reject(error61);
-      }
-    });
-    child.stdin.end(input2);
-  });
+  };
   return {
     scan(value) {
       const input2 = prepare(value);
       if (input2 !== null) scanInput(input2);
     },
     async scanMany(values) {
-      const inputs = values.map(prepare);
+      const inputs = values.map(prepare).filter((input2) => input2 !== null);
       const cancellation = new AbortController();
-      let firstError;
-      let next = 0;
-      await Promise.all(Array.from({ length: Math.min(ASYNC_SCREENING_PARALLELISM, inputs.length) }, async () => {
-        while (next < inputs.length && !firstError) {
-          const index = next++;
-          const input2 = inputs[index];
-          if (input2 === null) continue;
-          try {
-            const release = await acquireScannerSlot(cancellation.signal);
-            try {
-              await scanInputAsync(input2, cancellation.signal);
-            } finally {
-              release();
-            }
-          } catch (error61) {
-            if (!firstError) {
-              firstError = error61 instanceof Error ? error61 : unavailable();
-              cancellation.abort();
-            }
-          }
+      let batch = [];
+      let bytes = 0;
+      const flush = async () => {
+        if (batch.length === 0) return;
+        const release = await acquireScannerSlot(cancellation.signal);
+        try {
+          await scanInputAsync(batch, cancellation.signal);
+        } finally {
+          release();
         }
-      }));
-      if (firstError) throw firstError;
+        batch = [];
+        bytes = 0;
+      };
+      for (const input2 of inputs) {
+        const size = Buffer.byteLength(input2);
+        if (batch.length > 0 && (bytes + size > SCREENING_BATCH_BYTES || batch.length === SCREENING_BATCH_RECORDS)) {
+          await flush();
+        }
+        batch.push(input2);
+        bytes += size;
+      }
+      await flush();
     },
     close() {
       fs2.rmSync(directory, { recursive: true, force: true });
@@ -35507,7 +35638,7 @@ async function* admittedRecords(file2, policy, startLine = 1, endLine = Infinity
     throw new Error("Invalid record screening batch size");
   }
   const policySnapshot = JSON.stringify(policy);
-  assertUnchangedPolicy(policySnapshot);
+  const checkPolicy = policyGuard(policySnapshot);
   const input2 = fs2.openSync(file2, fs2.constants.O_RDONLY | fs2.constants.O_NOFOLLOW);
   const initial = fs2.fstatSync(input2);
   let stream;
@@ -35544,7 +35675,7 @@ async function* admittedRecords(file2, policy, startLine = 1, endLine = Infinity
     if (policy?.screening) {
       await screener?.scanMany(batch.map((record2) => record2.line));
       assertUnchangedInput(file2, initial);
-      assertUnchangedPolicy(policySnapshot);
+      checkPolicy();
     }
     for (const record2 of batch) yield record2;
     batch.length = 0;
@@ -35557,7 +35688,7 @@ async function* admittedRecords(file2, policy, startLine = 1, endLine = Infinity
     stream = fs2.createReadStream(file2, { fd: input2, autoClose: true, start: 0 });
     for await (const chunk of stream) {
       assertUnchangedInput(file2, initial);
-      assertUnchangedPolicy(policySnapshot);
+      checkPolicy();
       pending = Buffer.concat([pending, chunk]);
       let newline;
       while ((newline = pending.indexOf(10)) !== -1) {
@@ -35579,7 +35710,7 @@ async function* admittedRecords(file2, policy, startLine = 1, endLine = Infinity
     }
     yield* flush();
     assertUnchangedInput(file2, initial);
-    assertUnchangedPolicy(policySnapshot);
+    checkPolicy();
   } finally {
     if (stream) stream.destroy();
     else fs2.closeSync(input2);

@@ -307,6 +307,15 @@ describe('persistent record exclusion at native ingestion boundaries', () => {
     })()).rejects.toThrow(/changed during record admission/);
   });
 
+  it('performs one pinned whole-file marker preflight for an admitted record walk', async () => {
+    policy();
+    const read = vi.spyOn(fs, 'readSync');
+    const lines: string[] = [];
+    for await (const line of admittedConversationLines(sourceFile)) lines.push(line);
+    expect(lines.join('\n')).toContain('safe question one');
+    expect(read.mock.calls.length).toBe(2);
+  });
+
   it('does not let project-exclusion environment override record policy', async () => {
     policy();
     process.env.CONVERSATION_SEARCH_EXCLUDE_PROJECTS = 'unrelated-project';
