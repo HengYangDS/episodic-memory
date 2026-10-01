@@ -53,6 +53,7 @@ COMMANDS:
   (default)      Index all conversations
   --cleanup      Process only unindexed conversations (may generate AI summaries)
   --session ID   Index specific session (used by hook)
+  --path PATH    Index one exact native transcript path without AI summaries
   --verify       Check index health
   --verify-page  Run one read-only bounded verification page (JSON; never repairs)
   --repair       Broad repair (may re-embed and generate AI summaries)
@@ -64,7 +65,7 @@ OPTIONS:
   --no-summaries     Skip AI summary generation (no summary provider calls)
   --after-path PATH  Resume a verification page after an exact archive path
   --max-files N      Maximum archives visited in one page (default: 100)
-  --max-file-bytes N Maximum bytes in one parsed archive (default: 8388608)
+  --max-file-bytes N Maximum bytes for --path; per-file parse limit for --verify-page (default: 8388608)
   --max-parse-bytes N Maximum total parsed bytes in one page (default: 67108864)
   --help, -h         Show this help
 
@@ -119,6 +120,10 @@ async function main() {
 
       case '--session':
         await runScript('index-session', args);
+        break;
+
+      case '--path':
+        await runScript('index-path', args);
         break;
 
       case '--cleanup':

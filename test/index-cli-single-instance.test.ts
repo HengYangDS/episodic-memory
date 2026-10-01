@@ -13,6 +13,7 @@ import { acquireFileLock, releaseFileLock, type FileLockHandle } from '../src/fi
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const INDEX_CLI = join(REPO_ROOT, 'dist', 'index-cli.js');
+const PUBLIC_CLI = join(REPO_ROOT, 'cli', 'index-conversations.js');
 
 interface RunResult {
   status: number | null;
@@ -98,6 +99,20 @@ describe('index-cli single-instance lock (#97)', () => {
     expect(result.stdout).not.toMatch(/complete|healthy/i);
   });
 
+  it('reports a lock-blocked exact-path index as deferred rather than successful', () => {
+    const project = join(testDir, 'projects', 'project');
+    mkdirSync(project, { recursive: true });
+    const selected = join(project, 'selected.jsonl');
+    writeFileSync(selected, JSON.stringify({ type: 'user', message: { role: 'user', content: 'selected' } }) + '\n');
+    heldLock = acquireFileLock(lockPath);
+    expect(heldLock).not.toBeNull();
+
+    const result = runIndexCli(['index-path', selected]);
+
+    expect(result.status).toBe(2);
+    expect(existsSync(join(testDir, 'archive', 'project', 'selected.jsonl'))).toBe(false);
+  });
+
   it('returns a bounded, resumable verification page without a healthy verdict', () => {
     const projectDir = join(testDir, 'archive', 'project');
     mkdirSync(projectDir, { recursive: true });
@@ -176,5 +191,55 @@ describe('index-cli single-instance lock (#97)', () => {
     expect(next.status).toBe(0);
     expect(next.stderr).not.toMatch(/sync already running/);
     expect(next.stdout).toMatch(/Verification Results/);
+  });
+
+  it('indexes only the exact path supplied by a lifecycle hook without summaries', () => {
+    const project = join(testDir, 'projects', 'project');
+    mkdirSync(project, { recursive: true });
+    const selected = join(project, 'selected.jsonl');
+    const sibling = join(project, 'sibling.jsonl');
+    const userLine = (text: string) => JSON.stringify({ type: 'user', message: { role: 'user', content: text } }) + '\n';
+    writeFileSync(selected, userLine('selected'));
+    writeFileSync(sibling, userLine('sibling'));
+
+    const result = runIndexCli(['index-path', selected, '--no-summaries']);
+
+    expect(result.status).toBe(0);
+    expect(existsSync(join(testDir, 'archive', 'project', 'selected.jsonl'))).toBe(true);
+    expect(existsSync(join(testDir, 'archive', 'project', 'sibling.jsonl'))).toBe(false);
+    expect(existsSync(join(testDir, 'archive', 'project', 'selected-summary.txt'))).toBe(false);
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  it('routes the public --path option to exact indexing rather than a full scan', () => {
+    const project = join(testDir, 'projects', 'project');
+    mkdirSync(project, { recursive: true });
+    const selected = join(project, 'selected.jsonl');
+    const sibling = join(project, 'sibling.jsonl');
+    const userLine = (text: string) => JSON.stringify({ type: 'user', message: { role: 'user', content: text } }) + '\n';
+    writeFileSync(selected, userLine('selected'));
+    writeFileSync(sibling, userLine('sibling'));
+
+    const result = spawnSync(process.execPath, [PUBLIC_CLI, '--path', selected, '--no-summaries'], {
+      env: { ...process.env, ...envOverrides },
+      timeout: 120_000,
+      encoding: 'utf-8',
+    });
+
+    expect(result.status).toBe(0);
+    expect(existsSync(join(testDir, 'archive', 'project', 'selected.jsonl'))).toBe(true);
+    expect(existsSync(join(testDir, 'archive', 'project', 'sibling.jsonl'))).toBe(false);
+  });
+
+  it('accepts an explicit byte ceiling for exact-path indexing', () => {
+    const project = join(testDir, 'projects', 'project');
+    mkdirSync(project, { recursive: true });
+    const selected = join(project, 'selected.jsonl');
+    writeFileSync(selected, JSON.stringify({ type: 'user', message: { role: 'user', content: 'short' } }) + '\n');
+
+    const result = runIndexCli(['index-path', selected, '--max-file-bytes', '1024']);
+
+    expect(result.status).toBe(0);
+    expect(existsSync(join(testDir, 'archive', 'project', 'selected.jsonl'))).toBe(true);
   });
 });

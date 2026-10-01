@@ -1,5 +1,5 @@
 import fs from 'fs';
-import { archiveAdmittedConversation, readRecordExclusions } from './record-admission.js';
+import { archiveAdmittedConversation, readRecordExclusions, shouldSkipConversation } from './record-admission.js';
 import path from 'path';
 import { getExchangesNeedingIndex, initDatabase, insertExchange } from './db.js';
 import { parseConversation } from './parser.js';
@@ -25,6 +25,57 @@ async function processBatch(items, processor, concurrency) {
 }
 function sessionIdForSummary(exchanges) {
     return exchanges.find(exchange => exchange.sessionId)?.sessionId;
+}
+/** Index one native source transcript without scanning sibling files or generating a summary. */
+export async function indexExactPath(filePath, maxFileBytes) {
+    const exclusions = readRecordExclusions();
+    if (maxFileBytes !== undefined && (!Number.isSafeInteger(maxFileBytes) || maxFileBytes < 1)) {
+        throw new Error('Invalid exact index byte limit');
+    }
+    if (!path.isAbsolute(filePath) || path.resolve(filePath) !== filePath || !filePath.endsWith('.jsonl')) {
+        throw new Error('Exact transcript path must be an absolute .jsonl file');
+    }
+    const sourceInfo = fs.lstatSync(filePath);
+    if (!sourceInfo.isFile() || sourceInfo.isSymbolicLink()) {
+        throw new Error('Conversation source must be a regular non-symlink file');
+    }
+    if (maxFileBytes !== undefined && sourceInfo.size > maxFileBytes) {
+        throw new Error('Transcript exceeds exact index byte limit');
+    }
+    const sourcePath = fs.realpathSync(filePath);
+    const matched = getConversationSourceDirs().map(dir => {
+        const relative = path.relative(path.resolve(dir), filePath);
+        const canonical = path.relative(fs.realpathSync(dir), sourcePath);
+        return { relative, canonical };
+    }).find(({ relative, canonical }) => [relative, canonical].every(item => item.includes(path.sep) && !item.startsWith(`..${path.sep}`) && !path.isAbsolute(item)));
+    if (!matched)
+        throw new Error('Transcript is outside a configured source root');
+    const project = matched.relative.split(path.sep)[0];
+    if (getExcludedProjects().includes(project) || shouldSkipConversation(sourcePath))
+        return;
+    const archivePath = path.join(getArchiveDir(), matched.relative);
+    await archiveAdmittedConversation(sourcePath, archivePath, exclusions);
+    const exchanges = await parseConversation(archivePath, project, archivePath);
+    if (exchanges.length === 0)
+        return;
+    const db = initDatabase();
+    try {
+        const pending = getExchangesNeedingIndex(db, archivePath, exchanges);
+        if (pending.length === 0)
+            return;
+        await initEmbeddings();
+        const maxMessageBytes = getMaxMessageBytes();
+        for (const exchange of pending) {
+            if (isOversizeExchange(exchange, maxMessageBytes))
+                continue;
+            const toolNames = exchange.toolCalls?.map(call => call.toolName);
+            const embedding = await generateExchangeEmbedding(exchange.userMessage, exchange.assistantMessage, toolNames);
+            insertExchange(db, exchange, embedding, toolNames);
+        }
+    }
+    finally {
+        db.close();
+    }
 }
 export async function indexConversations(limitToProject, maxConversations, concurrency = 1, noSummaries = false) {
     readRecordExclusions();

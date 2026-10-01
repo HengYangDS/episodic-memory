@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { verifyIndex, repairIndex } from './verify.js';
-import { indexSession, indexUnprocessed, indexConversations } from './indexer.js';
+import { indexExactPath, indexSession, indexUnprocessed, indexConversations } from './indexer.js';
 import { getDbPath, getArchiveDir, statIfExists } from './paths.js';
 import fs from 'fs';
 import path from 'path';
@@ -60,7 +60,7 @@ if (!syncLock) {
     const holderLabel = holder !== null ? `pid ${holder}` : 'another process';
     // A skipped write may be retried by a hook; a skipped verifier is not a result.
     console.error(`episodic-memory: sync already running (${holderLabel}); skipping`);
-    process.exit(command === 'verify' || command === 'verify-page' ? 2 : 0);
+    process.exit(command === 'verify' || command === 'verify-page' || command === 'index-path' ? 2 : 0);
 }
 const releaseSyncLockOnce = () => {
     if (releaseSyncLockOnce.done)
@@ -99,6 +99,18 @@ async function main() {
                 }
                 await indexSession(sessionId, concurrency, noSummaries);
                 break;
+            case 'index-path': {
+                const filePath = process.argv[3];
+                const remaining = process.argv.slice(4).filter(arg => arg !== '--no-summaries');
+                const bounded = remaining.length === 2 && remaining[0] === '--max-file-bytes' &&
+                    /^[1-9]\d*$/.test(remaining[1]) && Number.isSafeInteger(Number(remaining[1]));
+                if (!filePath || (remaining.length > 0 && !bounded)) {
+                    console.error('Usage: index-cli index-path <absolute-transcript.jsonl> [--max-file-bytes N]');
+                    process.exit(1);
+                }
+                await indexExactPath(filePath, bounded ? Number(remaining[1]) : undefined);
+                break;
+            }
             case 'index-cleanup':
                 await indexUnprocessed(concurrency, noSummaries);
                 break;

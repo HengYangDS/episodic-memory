@@ -44,6 +44,14 @@ trusted_hash = "sha256:..."
 
 If the plugin changes the hook command or normalized hook config, Codex marks the hook modified and requires review again.
 
+The bundled `SessionStart` hook scans all configured sources and can generate AI summaries. Leave it disabled when that scope, source lifecycle, or model budget has not been admitted. For a deliberate single-file indexing operation, use the native source owner's exact `transcript_path`:
+
+```bash
+index-conversations --path "$TRANSCRIPT_PATH"
+```
+
+This path indexes only that source file under a configured transcript root, applies record exclusions, and never generates a summary. Add `--max-file-bytes N` to give an exact call a positive input-byte ceiling. The `cli/index-hook-transcript.js` adapter accepts a JSON hook event on stdin and returns `{}` for Codex `Stop` hooks. It requires an explicit `EPISODIC_MEMORY_HOOK_MAX_FILE_BYTES` ceiling; installing or trusting such a hook is a separate lifecycle decision. An exact path does not by itself prove that a session is complete, unarchived, or safe to summarize.
+
 ## Verify
 
 Run:
