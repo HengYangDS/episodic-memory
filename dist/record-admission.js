@@ -657,103 +657,178 @@ function filterRecord(line, number, policy, transcript, sessionId) {
     }
     return line;
 }
-/** Keep byte delimiters and physical line coordinates stable in derived copies. */
-async function* admittedRecords(file, policy, startLine = 1, endLine = Infinity, batchRecords = SCREENING_BATCH_RECORDS) {
-    if (!Number.isSafeInteger(batchRecords) || batchRecords < 1 || batchRecords > SCREENING_BATCH_RECORDS) {
-        throw new Error('Invalid record screening batch size');
-    }
+/** Own one marker preflight, descriptor, policy and scanner across sequential cursors. */
+function openRecordAdmission(file, policy) {
     const policySnapshot = JSON.stringify(policy);
     const checkPolicy = policyGuard(policySnapshot);
     const input = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
-    const initial = fs.fstatSync(input);
-    let stream;
+    let initial;
+    let excluded;
     let screener;
-    const decoder = new TextDecoder('utf-8', { fatal: true });
-    let pending = Buffer.alloc(0);
-    let sessionId = sessionFromPath(file);
-    let primaryIdentitySeen = false;
-    let number = 0;
-    const batch = [];
-    const batchLimit = policy?.screening ? batchRecords : 1;
-    let batchBytes = 0;
-    const admit = (bytes, terminated) => {
-        number++;
-        const crlf = terminated && bytes.at(-1) === 13;
-        const line = decoder.decode(crlf ? bytes.subarray(0, -1) : bytes);
-        let recordSession;
-        try {
-            recordSession = sessionFromRecord(JSON.parse(line));
-        }
-        catch { /* Parser owns malformed records. */ }
-        if (recordSession && !primaryIdentitySeen) {
-            if (sessionId && recordSession !== sessionId && (excludedSession(policy, sessionId) || excludedSession(policy, recordSession))) {
-                throw new Error('Record exclusion session identity mismatch');
-            }
-            sessionId = recordSession;
-            primaryIdentitySeen = true;
-        }
-        const filtered = number >= startLine && number <= endLine
-            ? filterRecord(line, number, policy, path.basename(file), sessionId) : '';
-        return { line: filtered, ending: terminated ? (crlf ? '\r\n' : '\n') : '' };
-    };
-    const flush = async function* () {
-        if (batch.length === 0)
-            return;
-        if (policy?.screening) {
-            await screener?.scanMany(batch.map(record => record.line));
-            assertUnchangedInput(file, initial);
-            checkPolicy();
-        }
-        for (const record of batch)
-            yield record;
-        batch.length = 0;
-        batchBytes = 0;
-    };
     try {
-        // The marker scan and record stream share one descriptor and identity.
-        // A path replacement cannot substitute a different unscanned transcript.
-        if (descriptorHasExclusionMarker(input))
-            return;
-        assertUnchangedInput(file, initial);
-        screener = createRecordScreener(policy);
-        stream = fs.createReadStream(file, { fd: input, autoClose: true, start: 0 });
-        for await (const chunk of stream) {
-            assertUnchangedInput(file, initial);
-            checkPolicy();
-            pending = Buffer.concat([pending, chunk]);
-            let newline;
-            while ((newline = pending.indexOf(10)) !== -1) {
-                const bytes = pending.subarray(0, newline);
-                if (batch.length > 0 && batchBytes + bytes.length > SCREENING_BATCH_BYTES)
-                    yield* flush();
-                const record = admit(bytes, true);
-                batch.push(record);
-                batchBytes += Buffer.byteLength(record.line) + Buffer.byteLength(record.ending);
-                pending = pending.subarray(newline + 1);
-                if (batch.length === batchLimit || batchBytes >= SCREENING_BATCH_BYTES)
-                    yield* flush();
-            }
-            if (pending.length > 64 * 1024 * 1024)
-                throw new Error('Conversation record exceeds admission byte limit');
-        }
-        if (pending.length) {
-            if (batch.length > 0 && batchBytes + pending.length > SCREENING_BATCH_BYTES)
-                yield* flush();
-            const record = admit(pending, false);
-            batch.push(record);
-            batchBytes += Buffer.byteLength(record.line);
-        }
-        yield* flush();
+        initial = fs.fstatSync(input);
+        excluded = descriptorHasExclusionMarker(input);
         assertUnchangedInput(file, initial);
         checkPolicy();
+        if (!excluded)
+            screener = createRecordScreener(policy);
+    }
+    catch (error) {
+        fs.closeSync(input);
+        throw error;
+    }
+    let active;
+    let closed = false;
+    let closing;
+    const records = (startLine = 1, endLine = Infinity, batchRecords = SCREENING_BATCH_RECORDS) => {
+        let cursor;
+        cursor = (async function* () {
+            if (!Number.isSafeInteger(batchRecords) || batchRecords < 1 || batchRecords > SCREENING_BATCH_RECORDS) {
+                throw new Error('Invalid record screening batch size');
+            }
+            if (closed || active)
+                throw new Error('Conversation admission is closed or already in use');
+            active = cursor;
+            let stream;
+            let streamClosed;
+            const decoder = new TextDecoder('utf-8', { fatal: true });
+            let pending = Buffer.alloc(0);
+            let sessionId = sessionFromPath(file);
+            let primaryIdentitySeen = false;
+            let number = 0;
+            const batch = [];
+            const batchLimit = policy?.screening ? batchRecords : 1;
+            let batchBytes = 0;
+            const admit = (bytes, terminated) => {
+                number++;
+                const crlf = terminated && bytes.at(-1) === 13;
+                const line = decoder.decode(crlf ? bytes.subarray(0, -1) : bytes);
+                let recordSession;
+                try {
+                    recordSession = sessionFromRecord(JSON.parse(line));
+                }
+                catch { /* Parser owns malformed records. */ }
+                if (recordSession && !primaryIdentitySeen) {
+                    if (sessionId && recordSession !== sessionId && (excludedSession(policy, sessionId) || excludedSession(policy, recordSession))) {
+                        throw new Error('Record exclusion session identity mismatch');
+                    }
+                    sessionId = recordSession;
+                    primaryIdentitySeen = true;
+                }
+                const filtered = number >= startLine && number <= endLine
+                    ? filterRecord(line, number, policy, path.basename(file), sessionId) : '';
+                return { line: filtered, ending: terminated ? (crlf ? '\r\n' : '\n') : '' };
+            };
+            const flush = async function* () {
+                if (batch.length === 0)
+                    return;
+                if (policy?.screening) {
+                    await screener?.scanMany(batch.map(record => record.line));
+                    assertUnchangedInput(file, initial);
+                    checkPolicy();
+                }
+                for (const record of batch)
+                    yield record;
+                batch.length = 0;
+                batchBytes = 0;
+            };
+            try {
+                assertUnchangedInput(file, initial);
+                checkPolicy();
+                if (excluded)
+                    return;
+                // A cursor destroys its stream, but only this context closes the pinned
+                // descriptor. Native stream close waits for any pending read to finish.
+                stream = fs.createReadStream(file, {
+                    fd: input, autoClose: true, start: 0,
+                    fs: { read: fs.read, close: (_fd, done) => done(null) },
+                });
+                streamClosed = new Promise(resolve => stream.once('close', resolve));
+                for await (const chunk of stream) {
+                    assertUnchangedInput(file, initial);
+                    checkPolicy();
+                    pending = Buffer.concat([pending, chunk]);
+                    let newline;
+                    while ((newline = pending.indexOf(10)) !== -1) {
+                        const bytes = pending.subarray(0, newline);
+                        if (batch.length > 0 && batchBytes + bytes.length > SCREENING_BATCH_BYTES)
+                            yield* flush();
+                        const record = admit(bytes, true);
+                        batch.push(record);
+                        batchBytes += Buffer.byteLength(record.line) + Buffer.byteLength(record.ending);
+                        pending = pending.subarray(newline + 1);
+                        if (batch.length === batchLimit || batchBytes >= SCREENING_BATCH_BYTES)
+                            yield* flush();
+                    }
+                    if (pending.length > 64 * 1024 * 1024)
+                        throw new Error('Conversation record exceeds admission byte limit');
+                }
+                if (pending.length) {
+                    if (batch.length > 0 && batchBytes + pending.length > SCREENING_BATCH_BYTES)
+                        yield* flush();
+                    const record = admit(pending, false);
+                    batch.push(record);
+                    batchBytes += Buffer.byteLength(record.line);
+                }
+                yield* flush();
+                assertUnchangedInput(file, initial);
+                checkPolicy();
+            }
+            finally {
+                if (stream) {
+                    stream.destroy();
+                    await streamClosed;
+                }
+                active = undefined;
+            }
+        })();
+        return cursor;
+    };
+    return {
+        records,
+        close() {
+            if (!closing) {
+                closed = true;
+                closing = (async () => {
+                    try {
+                        await active?.return(undefined);
+                    }
+                    finally {
+                        try {
+                            screener?.close();
+                        }
+                        finally {
+                            fs.closeSync(input);
+                        }
+                    }
+                })();
+            }
+            return closing;
+        },
+    };
+}
+/** Keep byte delimiters and physical line coordinates stable in derived copies. */
+async function* admittedRecords(file, policy, startLine = 1, endLine = Infinity, batchRecords = SCREENING_BATCH_RECORDS) {
+    const admission = openRecordAdmission(file, policy);
+    try {
+        yield* admission.records(startLine, endLine, batchRecords);
     }
     finally {
-        if (stream)
-            stream.destroy();
-        else
-            fs.closeSync(input);
-        screener?.close();
+        await admission.close();
     }
+}
+/** Give detection and parsing rewound, admitted cursors without caching their prefix. */
+export function openConversationAdmission(file, policy = readRecordExclusions()) {
+    if (!fs.lstatSync(file).isFile())
+        throw new Error('Conversation input must be a regular non-symlink file');
+    const admission = openRecordAdmission(file, policy);
+    return {
+        async *lines(batchRecords = SCREENING_BATCH_RECORDS) {
+            for await (const record of admission.records(1, Infinity, batchRecords))
+                yield record.line;
+        },
+        close: admission.close,
+    };
 }
 /** Read original inputs without mutation, preserving their physical line numbers. */
 export async function* admittedConversationLines(file, policy = readRecordExclusions(), batchRecords = SCREENING_BATCH_RECORDS) {

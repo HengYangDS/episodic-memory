@@ -26,6 +26,11 @@ export interface RecordExclusions {
 }
 export declare function readRecordExclusions(): RecordExclusions | null;
 export declare function excludedSession(policy: RecordExclusions | null, sessionId?: string): boolean;
+/** Give detection and parsing rewound, admitted cursors without caching their prefix. */
+export declare function openConversationAdmission(file: string, policy?: RecordExclusions | null): {
+    lines(batchRecords?: number): AsyncGenerator<string>;
+    close(): Promise<void>;
+};
 /** Read original inputs without mutation, preserving their physical line numbers. */
 export declare function admittedConversationLines(file: string, policy?: RecordExclusions | null, batchRecords?: number): AsyncGenerator<string>;
 /** Read the admitted display input without changing original physical coordinates. */

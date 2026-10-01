@@ -1,9 +1,8 @@
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
-import { admittedConversationLines } from './record-admission.js';
-async function detectConversationHarness(filePath) {
-    const rl = admittedConversationLines(filePath, undefined, 1);
+import { openConversationAdmission } from './record-admission.js';
+async function detectConversationHarness(rl) {
     for await (const line of rl) {
         if (!line.trim())
             continue;
@@ -52,24 +51,30 @@ async function detectConversationHarness(filePath) {
     return 'claude';
 }
 export async function parseConversation(filePath, projectName, archivePath) {
-    const harness = await detectConversationHarness(filePath);
-    if (harness === 'codex') {
-        return parseCodexConversation(filePath, projectName, archivePath);
+    const admission = openConversationAdmission(filePath);
+    try {
+        const harness = await detectConversationHarness(admission.lines(1));
+        const lines = admission.lines();
+        if (harness === 'codex') {
+            return await parseCodexConversation(filePath, projectName, archivePath, lines);
+        }
+        if (harness === 'cursor') {
+            return await parseCursorConversation(filePath, projectName, archivePath, lines);
+        }
+        if (harness === 'opencode') {
+            return await parseOpencodeConversation(filePath, projectName, archivePath, lines);
+        }
+        if (harness === 'omp') {
+            return await parseOmpConversation(filePath, projectName, archivePath, lines);
+        }
+        return await parseClaudeConversation(filePath, projectName, archivePath, lines);
     }
-    if (harness === 'cursor') {
-        return parseCursorConversation(filePath, projectName, archivePath);
+    finally {
+        await admission.close();
     }
-    if (harness === 'opencode') {
-        return parseOpencodeConversation(filePath, projectName, archivePath);
-    }
-    if (harness === 'omp') {
-        return parseOmpConversation(filePath, projectName, archivePath);
-    }
-    return parseClaudeConversation(filePath, projectName, archivePath);
 }
-async function parseClaudeConversation(filePath, projectName, archivePath) {
+async function parseClaudeConversation(filePath, projectName, archivePath, rl) {
     const exchanges = [];
-    const rl = admittedConversationLines(filePath);
     let lineNumber = 0;
     let currentExchange = null;
     const finalizeExchange = () => {
@@ -333,9 +338,8 @@ function extractOpencodeToolCalls(parts, fallbackTimestamp) {
     }
     return toolCalls;
 }
-async function parseOpencodeConversation(filePath, projectName, archivePath) {
+async function parseOpencodeConversation(filePath, projectName, archivePath, rl) {
     const exchanges = [];
-    const rl = admittedConversationLines(filePath);
     let lineNumber = 0;
     let sessionId;
     let cwd;
@@ -510,9 +514,8 @@ function extractOmpText(content) {
  * #139 byte-cap correct. A streaming single pass can't do the leaf->root walk,
  * so we read every line with its line number first, then walk the tree.
  */
-async function parseOmpConversation(filePath, projectName, archivePath) {
+async function parseOmpConversation(filePath, projectName, archivePath, rl) {
     const exchanges = [];
-    const rl = admittedConversationLines(filePath);
     let sessionId;
     let cwd;
     let headerTimestamp;
@@ -614,9 +617,8 @@ async function parseOmpConversation(filePath, projectName, archivePath) {
     finalizeExchange();
     return exchanges;
 }
-async function parseCodexConversation(filePath, projectName, archivePath) {
+async function parseCodexConversation(filePath, projectName, archivePath, rl) {
     const exchanges = [];
-    const rl = admittedConversationLines(filePath);
     let lineNumber = 0;
     let sessionId;
     let cwd;
@@ -863,9 +865,8 @@ function cursorProjectFromPath(filePath) {
     return undefined;
 }
 const UUID_PATTERN = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
-async function parseCursorConversation(filePath, projectName, archivePath) {
+async function parseCursorConversation(filePath, projectName, archivePath, rl) {
     const exchanges = [];
-    const rl = admittedConversationLines(filePath);
     // Live Cursor transcripts carry no per-message timestamps; fall back to the
     // file mtime (preserved from the source by sync's copyIfNewer). Legacy
     // exports from import-cursor-history embed real per-message timestamps.
