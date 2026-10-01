@@ -6,6 +6,7 @@ import { getAllExchanges, getExchangesNeedingIndex } from './db.js';
 import { getArchiveDir, getDbPath, getExcludedProjects, findJsonlFiles, statIfExists } from './paths.js';
 import { isErroredSentinel } from './summary-sentinel.js';
 import { readRecordExclusions } from './record-admission.js';
+import { getMaxMessageBytes, isOversizeExchange } from './message-size.js';
 
 export interface VerificationResult {
   missing: Array<{ path: string; reason: string }>;
@@ -76,6 +77,7 @@ export async function verifyIndex(options: VerificationOptions = {}): Promise<Ve
   const maxFiles = positiveLimit(options.maxFiles, 'maxFiles');
   const maxFileBytes = positiveLimit(options.maxFileBytes, 'maxFileBytes');
   const maxParseBytes = positiveLimit(options.maxParseBytes, 'maxParseBytes');
+  const maxMessageBytes = getMaxMessageBytes();
   const projects = fs.readdirSync(archiveDir).sort();
   const excludedProjects = getExcludedProjects();
   const excludedDirSet = new Set(excludedProjects);
@@ -164,11 +166,14 @@ export async function verifyIndex(options: VerificationOptions = {}): Promise<Ve
     try {
       const exchanges = await parseConversation(conversationPath, project, conversationPath);
       if (maxLineEnd === null) {
-        if (exchanges.length > 0) result.unindexed.push({ path: conversationPath });
+        if (exchanges.some(exchange => !isOversizeExchange(exchange, maxMessageBytes))) {
+          result.unindexed.push({ path: conversationPath });
+        }
       } else {
         const fileTime = fileStat.mtimeMs;
         const dbTime = state?.lastIndexed ?? 0;
-        if (getExchangesNeedingIndex(db!, conversationPath, exchanges).length > 0) {
+        const pending = getExchangesNeedingIndex(db!, conversationPath, exchanges);
+        if (pending.some(exchange => !isOversizeExchange(exchange, maxMessageBytes))) {
           result.outdated.push({ path: conversationPath, fileTime, dbTime });
         } else if (state?.lastIndexed != null && fileTime > state.lastIndexed) {
           result.archiveRefreshes.push({ path: conversationPath, fileTime, dbTime });

@@ -429,7 +429,11 @@ complete verification result and is not the normal summary-backfill path.
 
 An archive mtime refresh without new exchanges is reported separately and is
 not an outdated-index repair target. An unindexed archive is reported, but
-that status alone does not select it for `--repair`; a separate overlapping
+only exchanges within the indexer's configured per-message byte limit count
+as pending index work. Oversized messages remain deliberately skipped; the
+verifier still validates all indexed spans before filtering pending work, so
+a contracted oversized span remains an error rather than being hidden.
+That unindexed status alone does not select an archive for `--repair`; a separate overlapping
 repair category may still cause it to be processed.
 
 ### `episodic-memory search`

@@ -62,6 +62,90 @@ describe('verifyIndex', () => {
     expect(fs.existsSync(dbPath)).toBe(false);
   });
 
+  it.each(['user', 'assistant'])('does not label a byte-excluded %s message as unindexed', async role => {
+    const previousLimit = process.env.EPISODIC_MEMORY_MAX_MESSAGE_BYTES;
+    process.env.EPISODIC_MEMORY_MAX_MESSAGE_BYTES = '32';
+    const projectArchive = path.join(archiveDir, 'oversize-project');
+    fs.mkdirSync(projectArchive, { recursive: true });
+    const conversationPath = path.join(projectArchive, 'oversize.jsonl');
+    fs.writeFileSync(conversationPath, [
+      JSON.stringify({ type: 'user', message: { role: 'user', content: role === 'user' ? 'é'.repeat(17) : 'Question' }, timestamp: '2024-01-01T00:00:00Z' }),
+      JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: role === 'assistant' ? 'é'.repeat(17) : 'Answer' }, timestamp: '2024-01-01T00:00:01Z' }),
+    ].join('\n'));
+
+    try {
+      const result = await verifyIndex();
+      expect(result.unindexed).toEqual([]);
+      expect(result.outdated).toEqual([]);
+      expect(result.missing.map(item => item.path)).toContain(conversationPath);
+      expect(fs.existsSync(dbPath)).toBe(false);
+    } finally {
+      if (previousLimit === undefined) delete process.env.EPISODIC_MEMORY_MAX_MESSAGE_BYTES;
+      else process.env.EPISODIC_MEMORY_MAX_MESSAGE_BYTES = previousLimit;
+    }
+  });
+
+  it.each([false, true])('filters an oversized append but retains a size-eligible append: %s', async hasEligibleAppend => {
+    const previousLimit = process.env.EPISODIC_MEMORY_MAX_MESSAGE_BYTES;
+    process.env.EPISODIC_MEMORY_MAX_MESSAGE_BYTES = '32';
+    const projectArchive = path.join(archiveDir, 'oversize-project');
+    fs.mkdirSync(projectArchive, { recursive: true });
+    const conversationPath = path.join(projectArchive, 'append.jsonl');
+    const initial = [
+      { type: 'user', message: { role: 'user', content: 'Question' }, timestamp: '2024-01-01T00:00:00Z' },
+      { type: 'assistant', message: { role: 'assistant', content: 'Answer' }, timestamp: '2024-01-01T00:00:01Z' },
+    ];
+    fs.writeFileSync(conversationPath, initial.map(value => JSON.stringify(value)).join('\n'));
+    const db = initDatabase();
+    const [first] = await parseConversation(conversationPath, 'oversize-project', conversationPath);
+    insertExchange(db, first, new Array(384).fill(0.1));
+    db.close();
+    const appended = [
+      ...initial,
+      { type: 'user', message: { role: 'user', content: 'é'.repeat(17) }, timestamp: '2024-01-01T00:00:02Z' },
+      { type: 'assistant', message: { role: 'assistant', content: 'Oversized input skipped' }, timestamp: '2024-01-01T00:00:03Z' },
+      ...(hasEligibleAppend ? [
+        { type: 'user', message: { role: 'user', content: 'Next question' }, timestamp: '2024-01-01T00:00:04Z' },
+        { type: 'assistant', message: { role: 'assistant', content: 'Next answer' }, timestamp: '2024-01-01T00:00:05Z' },
+      ] : []),
+    ];
+    fs.writeFileSync(conversationPath, appended.map(value => JSON.stringify(value)).join('\n'));
+
+    try {
+      const result = await verifyIndex();
+      expect(result.outdated.map(item => item.path)).toEqual(hasEligibleAppend ? [conversationPath] : []);
+      expect(result.corrupted).toEqual([]);
+    } finally {
+      if (previousLimit === undefined) delete process.env.EPISODIC_MEMORY_MAX_MESSAGE_BYTES;
+      else process.env.EPISODIC_MEMORY_MAX_MESSAGE_BYTES = previousLimit;
+    }
+  });
+
+  it('still refuses an indexed oversized span regression', async () => {
+    const previousLimit = process.env.EPISODIC_MEMORY_MAX_MESSAGE_BYTES;
+    process.env.EPISODIC_MEMORY_MAX_MESSAGE_BYTES = '32';
+    const projectArchive = path.join(archiveDir, 'oversize-project');
+    fs.mkdirSync(projectArchive, { recursive: true });
+    const conversationPath = path.join(projectArchive, 'regressed.jsonl');
+    fs.writeFileSync(conversationPath, [
+      JSON.stringify({ type: 'user', message: { role: 'user', content: 'é'.repeat(17) }, timestamp: '2024-01-01T00:00:00Z' }),
+      JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: 'Answer' }, timestamp: '2024-01-01T00:00:01Z' }),
+    ].join('\n'));
+    const [parsed] = await parseConversation(conversationPath, 'oversize-project', conversationPath);
+    const db = initDatabase();
+    insertExchange(db, { ...parsed, id: 'older-long-span', lineEnd: parsed.lineEnd + 1 }, new Array(384).fill(0.1));
+    db.close();
+
+    try {
+      const result = await verifyIndex();
+      expect(result.corrupted).toEqual([{ path: conversationPath, error: 'Conversation exchange span regressed' }]);
+      expect(result.outdated).toEqual([]);
+    } finally {
+      if (previousLimit === undefined) delete process.env.EPISODIC_MEMORY_MAX_MESSAGE_BYTES;
+      else process.env.EPISODIC_MEMORY_MAX_MESSAGE_BYTES = previousLimit;
+    }
+  });
+
   it('should skip excluded projects', async () => {
     // Create two projects in archive
     const projectA = path.join(archiveDir, 'project-a');

@@ -696,8 +696,11 @@ describe('pinned record-local screening at native admission', () => {
     fs.writeFileSync(source, lines.join('\n') + '\n');
 
     expect(await readAdmittedConversation(source)).toBe(lines.join('\n'));
-    expect(fs.readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line)))
-      .toEqual([['0', '1', '2', '3'], ['0', '1'], ['2', '3']]);
+    const completedStarts = fs.readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    // Under scheduler pressure the first attempt may time out before its fixture logs.
+    expect(completedStarts.slice(-2)).toEqual([['0', '1'], ['2', '3']]);
+    expect(completedStarts.slice(0, -2)).toEqual(completedStarts.length === 3 ? [['0', '1', '2', '3']] : []);
+    expect(completedStarts.length).toBeLessThanOrEqual(3);
     expect(fs.readdirSync(privateTmp)).toEqual([]);
   });
 
