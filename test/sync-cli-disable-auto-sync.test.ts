@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { spawnSync } from 'child_process';
-import { mkdtempSync, mkdirSync, rmSync } from 'fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { tmpdir } from 'os';
@@ -12,6 +12,19 @@ describe('sync-cli auto-sync off switch (#163)', () => {
   let testDir: string;
   let envOverrides: Record<string, string>;
 
+  function waitForBackgroundSync(): void {
+    const log = join(testDir, 'config', 'logs', 'episodic-memory.log');
+    const lock = join(testDir, 'config', 'logs', 'episodic-memory-sync.lock');
+    const deadline = Date.now() + 10_000;
+    const pause = new Int32Array(new SharedArrayBuffer(4));
+    while (Date.now() < deadline) {
+      if (existsSync(log) && readFileSync(log, 'utf8').includes('Sync complete!') &&
+          !existsSync(lock) && !existsSync(`${lock}.lock`)) return;
+      Atomics.wait(pause, 0, 0, 50);
+    }
+    throw new Error('Background sync did not finish within the test deadline');
+  }
+
   beforeEach(() => {
     testDir = mkdtempSync(join(tmpdir(), 'episodic-memory-disable-auto-sync-'));
     mkdirSync(join(testDir, 'projects'), { recursive: true });
@@ -21,11 +34,13 @@ describe('sync-cli auto-sync off switch (#163)', () => {
       TEST_PROJECTS_DIR: join(testDir, 'projects'),
       TEST_DB_PATH: join(testDir, 'test.db'),
       EPISODIC_MEMORY_CONFIG_DIR: join(testDir, 'config'),
+      EPISODIC_MEMORY_OPENCODE_DB_PATH: join(testDir, 'missing-opencode.db'),
     };
   });
 
   afterEach(() => {
-    try { rmSync(testDir, { recursive: true, force: true }); } catch {}
+    rmSync(testDir, { recursive: true, force: true });
+    expect(existsSync(testDir)).toBe(false);
   });
 
   it('exits 0 silently and skips the background sync when EPISODIC_MEMORY_DISABLE_AUTO_SYNC=1 is set with --background', () => {
@@ -75,5 +90,7 @@ describe('sync-cli auto-sync off switch (#163)', () => {
 
     expect(result.status).toBe(0);
     expect(result.stdout).toMatch(/Sync started in background/);
+    waitForBackgroundSync();
+    expect(existsSync(join(testDir, 'config', 'opencode-transcripts'))).toBe(false);
   });
 });

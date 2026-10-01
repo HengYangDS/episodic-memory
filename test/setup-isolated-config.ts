@@ -1,6 +1,7 @@
-import { mkdtempSync } from 'fs';
+import { existsSync, mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { afterAll } from 'vitest';
 import { testModelCacheDir } from './test-model-cache.js';
 
 /**
@@ -10,6 +11,11 @@ import { testModelCacheDir } from './test-model-cache.js';
  * See https://github.com/obra/episodic-memory/issues/119
  */
 const isolatedRoot = mkdtempSync(join(tmpdir(), 'episodic-memory-vitest-'));
+
+afterAll(() => {
+  rmSync(isolatedRoot, { recursive: true, force: true });
+  if (existsSync(isolatedRoot)) throw new Error('Isolated test configuration was not removed');
+});
 
 process.env.EPISODIC_MEMORY_CONFIG_DIR = join(isolatedRoot, 'superpowers');
 process.env.CLAUDE_CONFIG_DIR = join(isolatedRoot, 'claude');
