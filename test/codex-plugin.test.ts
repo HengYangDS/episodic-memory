@@ -22,7 +22,7 @@ describe('Codex plugin packaging', () => {
     expect(existsSync(join(REPO_ROOT, 'hooks/hooks.json'))).toBe(true);
     expect(manifest.mcpServers).toBe('./.mcp.json');
     expect(manifest.interface.displayName).toBe('Episodic Memory');
-    expect(manifest.interface.shortDescription).toContain('conversation memory');
+    expect(manifest.interface.shortDescription).toContain('conversation recall');
     expect(manifest.interface.defaultPrompt).toContain('conversation');
   });
 

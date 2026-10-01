@@ -404,7 +404,15 @@ Manual indexing tools for bulk operations and maintenance. See `episodic-memory 
 Common operations:
 - `--cleanup` - Index unprocessed exchanges; summaries may call an AI provider unless disabled
 - `--verify` - Distinguish missing summaries, unindexed archives, appended exchanges, and archive mtime refreshes
+- `--verify-page` - Read-only JSON page with file and byte caps; status 2 means no complete health verdict, including the last resumed page
 - `--repair` - Re-embed and regenerate summaries for repair candidates; review the scope and provider cost first
+
+Use `--after-path` with the preceding page's `nextCursor` to resume. A resumed
+page never proves whole-index health, even when its `nextCursor` is null. The
+file and byte caps are not a wall-clock deadline: record screening can be
+expensive, so give real-archive runs a caller-owned process deadline and retain
+their partial results as diagnostic evidence only. `--repair` accepts only a
+complete verification result and is not the normal summary-backfill path.
 
 An archive mtime refresh without new exchanges is reported separately and is
 not an outdated-index repair target. An unindexed archive is reported, but

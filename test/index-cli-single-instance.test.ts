@@ -87,6 +87,50 @@ describe('index-cli single-instance lock (#97)', () => {
     expect(existsSync(join(testDir, 'test.db'))).toBe(false);
   });
 
+  it('reports a lock-blocked verification page as incomplete', () => {
+    heldLock = acquireFileLock(lockPath);
+    expect(heldLock).not.toBeNull();
+
+    const result = runIndexCli(['verify-page', '--max-files', '1']);
+
+    expect(result.status).toBe(2);
+    expect(result.stderr).toMatch(/sync already running.*skipping/);
+    expect(result.stdout).not.toMatch(/complete|healthy/i);
+  });
+
+  it('returns a bounded, resumable verification page without a healthy verdict', () => {
+    const projectDir = join(testDir, 'archive', 'project');
+    mkdirSync(projectDir, { recursive: true });
+    for (const name of ['a', 'b']) {
+      writeFileSync(join(projectDir, `${name}.jsonl`), [
+        JSON.stringify({ type: 'user', message: { role: 'user', content: name }, timestamp: '2024-01-01T00:00:00Z' }),
+        JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: name }, timestamp: '2024-01-01T00:00:01Z' }),
+      ].join('\n'));
+    }
+
+    const first = runIndexCli(['verify-page', '--max-files', '1', '--max-file-bytes', '1024', '--max-parse-bytes', '1024']);
+    expect(first.status).toBe(2);
+    const firstPage = JSON.parse(first.stdout);
+    expect(firstPage.visitedFiles).toBe(1);
+    expect(firstPage.complete).toBe(false);
+    expect(firstPage.nextCursor).toBe(join(projectDir, 'a.jsonl'));
+
+    const second = runIndexCli(['verify-page', '--after-path', firstPage.nextCursor, '--max-files', '1', '--max-file-bytes', '1024', '--max-parse-bytes', '1024']);
+    expect(second.status).toBe(2);
+    const secondPage = JSON.parse(second.stdout);
+    expect(secondPage.visitedFiles).toBe(1);
+    expect(secondPage.nextCursor).toBeNull();
+    expect(secondPage.complete).toBe(false);
+    expect(existsSync(join(testDir, 'test.db'))).toBe(false);
+  });
+
+  it('rejects malformed verification limits before scanning', () => {
+    const result = runIndexCli(['verify-page', '--max-files', '1oops']);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toMatch(/Invalid --max-files/);
+    expect(result.stdout).not.toMatch(/healthy/i);
+  });
+
   it('reports unindexed archives as actionable without calling them outdated', () => {
     const projectDir = join(testDir, 'archive', 'project');
     mkdirSync(projectDir, { recursive: true });

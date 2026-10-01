@@ -10,6 +10,49 @@ import { acquireFileLock, readLockHolder, releaseFileLock } from './file-lock.js
 
 const command = process.argv[2];
 
+const PAGE_DEFAULTS = {
+  maxFiles: 100,
+  maxFileBytes: 8 * 1024 * 1024,
+  maxParseBytes: 64 * 1024 * 1024
+};
+
+function parseVerifyPageArgs(args: string[]) {
+  const options: { afterPath?: string; maxFiles: number; maxFileBytes: number; maxParseBytes: number; quiet: true } = {
+    ...PAGE_DEFAULTS,
+    quiet: true
+  };
+  const names: Record<string, 'afterPath' | 'maxFiles' | 'maxFileBytes' | 'maxParseBytes'> = {
+    '--after-path': 'afterPath',
+    '--max-files': 'maxFiles',
+    '--max-file-bytes': 'maxFileBytes',
+    '--max-parse-bytes': 'maxParseBytes'
+  };
+  const seen = new Set<string>();
+  for (let index = 0; index < args.length; index += 2) {
+    const flag = args[index];
+    const name = names[flag];
+    if (!name || seen.has(flag)) throw new Error(`Invalid verification option: ${flag}`);
+    seen.add(flag);
+    const value = args[index + 1];
+    if (value === undefined) throw new Error(`Missing value for ${flag}`);
+    if (name === 'afterPath') {
+      if (!path.isAbsolute(value)) throw new Error('Invalid --after-path: expected an absolute archive path');
+      options.afterPath = value;
+    } else {
+      if (!/^[1-9]\d*$/.test(value) || !Number.isSafeInteger(Number(value))) {
+        throw new Error(`Invalid ${flag}: expected a positive safe integer`);
+      }
+      options[name] = Number(value);
+    }
+  }
+  return options;
+}
+
+function hasVerificationIssues(issues: Awaited<ReturnType<typeof verifyIndex>>): boolean {
+  return issues.missing.length + issues.unindexed.length + issues.orphaned.length + issues.outdated.length +
+    issues.screeningRejected.length + issues.screeningUnavailable.length + issues.corrupted.length > 0;
+}
+
 // Serialize the whole CLI with `sync-cli`: writers mutate the index/archive,
 // and verification must not claim a consistent result while one is active.
 const syncLockPath = getSyncLockPath();
@@ -19,7 +62,7 @@ if (!syncLock) {
   const holderLabel = holder !== null ? `pid ${holder}` : 'another process';
   // A skipped write may be retried by a hook; a skipped verifier is not a result.
   console.error(`episodic-memory: sync already running (${holderLabel}); skipping`);
-  process.exit(command === 'verify' ? 2 : 0);
+  process.exit(command === 'verify' || command === 'verify-page' ? 2 : 0);
 }
 const releaseSyncLockOnce = () => {
   if ((releaseSyncLockOnce as any).done) return;
@@ -78,6 +121,13 @@ async function main() {
         console.log(`Screening-rejected archives: ${issues.screeningRejected.length}`);
         console.log(`Screening-unavailable archives: ${issues.screeningUnavailable.length}`);
         console.log(`Corrupted files: ${issues.corrupted.length}`);
+        console.log(`Deferred files: ${issues.deferred.length}`);
+
+        if (!issues.complete) {
+          console.error('Verification is incomplete; no healthy verdict is available.');
+          process.exitCode = 2;
+          break;
+        }
 
         if (issues.missing.length > 0) {
           console.log('\nMissing summaries:');
@@ -92,8 +142,7 @@ async function main() {
           issues.outdated.forEach(item => console.log(`  ${item.path}`));
         }
 
-        if (issues.missing.length + issues.unindexed.length + issues.orphaned.length + issues.outdated.length +
-            issues.screeningRejected.length + issues.screeningUnavailable.length + issues.corrupted.length > 0) {
+        if (hasVerificationIssues(issues)) {
           console.log('\nReview exact candidates before repair; --repair may regenerate summaries and embeddings.');
           process.exit(1);
         } else {
@@ -101,9 +150,22 @@ async function main() {
         }
         break;
 
+      case 'verify-page': {
+        const page = await verifyIndex(parseVerifyPageArgs(process.argv.slice(3)));
+        console.log(JSON.stringify(page));
+        process.exitCode = !page.complete ? 2 : hasVerificationIssues(page) ? 1 : 0;
+        break;
+      }
+
       case 'repair':
         console.log('Verifying conversation index...');
         const repairIssues = await verifyIndex();
+
+        if (!repairIssues.complete) {
+          console.error('Verification is incomplete; repair was not started.');
+          process.exitCode = 2;
+          break;
+        }
 
         if (repairIssues.screeningRejected.length + repairIssues.screeningUnavailable.length > 0) {
           console.error('Record screening failures require review; repair was not started.');

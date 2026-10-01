@@ -30,6 +30,22 @@ export interface VerificationResult {
         path: string;
         error: string;
     }>;
+    deferred: Array<{
+        path: string;
+        size: number;
+        reason: string;
+    }>;
+    visitedFiles: number;
+    totalFiles: number;
+    nextCursor: string | null;
+    complete: boolean;
 }
-export declare function verifyIndex(): Promise<VerificationResult>;
+export interface VerificationOptions {
+    afterPath?: string;
+    maxFiles?: number;
+    maxFileBytes?: number;
+    maxParseBytes?: number;
+    quiet?: boolean;
+}
+export declare function verifyIndex(options?: VerificationOptions): Promise<VerificationResult>;
 export declare function repairIndex(issues: VerificationResult): Promise<void>;

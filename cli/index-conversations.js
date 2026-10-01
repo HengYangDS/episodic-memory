@@ -8,14 +8,15 @@ import { createInterface } from 'readline';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(realpathSync(__filename));
 
-function runScript(command, args) {
+function runScript(command, args, acceptedExitCodes = [0]) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [join(__dirname, '../dist/index-cli.js'), command, ...args], {
       stdio: 'inherit'
     });
 
     child.on('exit', (code) => {
-      if (code === 0) {
+      if (acceptedExitCodes.includes(code)) {
+        process.exitCode = code;
         resolve();
       } else {
         reject(new Error(`Command failed with exit code ${code}`));
@@ -53,6 +54,7 @@ COMMANDS:
   --cleanup      Process only unindexed conversations (may generate AI summaries)
   --session ID   Index specific session (used by hook)
   --verify       Check index health
+  --verify-page  Run one read-only bounded verification page (JSON; never repairs)
   --repair       Broad repair (may re-embed and generate AI summaries)
   --rebuild      Delete DB and re-index everything (requires confirmation)
 
@@ -60,6 +62,10 @@ OPTIONS:
   --concurrency N    Parallel summarization (1-16, default: 1)
   -c N               Short form of --concurrency
   --no-summaries     Skip AI summary generation (no summary provider calls)
+  --after-path PATH  Resume a verification page after an exact archive path
+  --max-files N      Maximum archives visited in one page (default: 100)
+  --max-file-bytes N Maximum bytes in one parsed archive (default: 8388608)
+  --max-parse-bytes N Maximum total parsed bytes in one page (default: 67108864)
   --help, -h         Show this help
 
 EXAMPLES:
@@ -74,6 +80,9 @@ EXAMPLES:
 
   # Check index health
   index-conversations --verify
+
+  # Bounded page: status 2 means incomplete, even at the final cursor
+  index-conversations --verify-page --max-files 100
 
   # Broad repair requires a separate scope and provider budget decision
   index-conversations --repair
@@ -118,6 +127,10 @@ async function main() {
 
       case '--verify':
         await runScript('verify', args);
+        break;
+
+      case '--verify-page':
+        await runScript('verify-page', args, [0, 1, 2]);
         break;
 
       case '--repair':

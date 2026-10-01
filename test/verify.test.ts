@@ -229,6 +229,52 @@ describe('verifyIndex', () => {
     expect(result.outdated[0].fileTime).toBeGreaterThan(lastIndexed);
   });
 
+  it('pages a deep verification without reporting a partial page as healthy', async () => {
+    const projectArchive = path.join(archiveDir, 'paged-project');
+    fs.mkdirSync(projectArchive, { recursive: true });
+    for (const name of ['a', 'b', 'c']) {
+      fs.writeFileSync(path.join(projectArchive, `${name}.jsonl`), [
+        JSON.stringify({ type: 'user', message: { role: 'user', content: name }, timestamp: '2024-01-01T00:00:00Z' }),
+        JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: `Answer ${name}` }, timestamp: '2024-01-01T00:00:01Z' }),
+      ].join('\n'));
+    }
+
+    const first = await verifyIndex({ maxFiles: 1, maxFileBytes: 1024, maxParseBytes: 1024 });
+    expect(first.visitedFiles).toBe(1);
+    expect(first.totalFiles).toBe(3);
+    expect(first.complete).toBe(false);
+    expect(first.unindexed.map(item => path.basename(item.path))).toEqual(['a.jsonl']);
+
+    const second = await verifyIndex({ afterPath: first.nextCursor!, maxFiles: 1, maxFileBytes: 1024, maxParseBytes: 1024 });
+    expect(second.unindexed.map(item => path.basename(item.path))).toEqual(['b.jsonl']);
+    expect(second.complete).toBe(false);
+
+    const third = await verifyIndex({ afterPath: second.nextCursor!, maxFiles: 1, maxFileBytes: 1024, maxParseBytes: 1024 });
+    expect(third.unindexed.map(item => path.basename(item.path))).toEqual(['c.jsonl']);
+    expect(third.nextCursor).toBeNull();
+    expect(third.complete).toBe(false);
+  });
+
+  it('defers a file over the explicit byte cap rather than calling it unindexed', async () => {
+    const projectArchive = path.join(archiveDir, 'large-project');
+    fs.mkdirSync(projectArchive, { recursive: true });
+    const conversationPath = path.join(projectArchive, 'large.jsonl');
+    fs.writeFileSync(conversationPath, [
+      JSON.stringify({ type: 'user', message: { role: 'user', content: 'x'.repeat(200) }, timestamp: '2024-01-01T00:00:00Z' }),
+      JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: 'Answer' }, timestamp: '2024-01-01T00:00:01Z' }),
+    ].join('\n'));
+
+    const result = await verifyIndex({ maxFiles: 10, maxFileBytes: 100, maxParseBytes: 1000 });
+    expect(result.deferred.map(item => item.path)).toEqual([conversationPath]);
+    expect(result.unindexed).toEqual([]);
+    expect(result.complete).toBe(false);
+    expect(result.nextCursor).toBeNull();
+  });
+
+  it('rejects a resume cursor that is not a current archive file', async () => {
+    await expect(verifyIndex({ afterPath: path.join(archiveDir, '..', 'outside.jsonl'), maxFiles: 1 })).rejects.toThrow(/cursor/);
+  });
+
   it('does not call an mtime-only archive refresh an index delta', async () => {
     const projectArchive = path.join(archiveDir, 'test-project');
     fs.mkdirSync(projectArchive, { recursive: true });
@@ -359,6 +405,24 @@ describe('repairIndex', () => {
     delete process.env.TEST_DB_PATH;
   });
 
+  it('refuses partial verification before opening a writable index or calling a provider', async () => {
+    const projectArchive = path.join(archiveDir, 'test-project');
+    fs.mkdirSync(projectArchive, { recursive: true });
+    for (const name of ['a', 'b']) {
+      fs.writeFileSync(path.join(projectArchive, `${name}.jsonl`), [
+        JSON.stringify({ type: 'user', message: { role: 'user', content: name }, timestamp: '2024-01-01T00:00:00Z' }),
+        JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: name }, timestamp: '2024-01-01T00:00:01Z' }),
+      ].join('\n'));
+    }
+    const page = await verifyIndex({ maxFiles: 1 });
+    expect(page.complete).toBe(false);
+    vi.mocked(summarizeConversation).mockClear();
+
+    await expect(repairIndex(page)).rejects.toThrow(/incomplete verification/i);
+    expect(vi.mocked(summarizeConversation)).not.toHaveBeenCalled();
+    expect(fs.existsSync(dbPath)).toBe(false);
+  });
+
   it('repairs a path reported as both missing and outdated only once', async () => {
     const projectArchive = path.join(archiveDir, 'test-project');
     fs.mkdirSync(projectArchive, { recursive: true });
@@ -419,7 +483,7 @@ describe('repairIndex', () => {
   it('rejects a failed repair instead of reporting completion', async () => {
     const input = path.join(archiveDir, 'not-a-transcript');
     fs.mkdirSync(input, { recursive: true });
-    await expect(repairIndex({ missing: [{ path: input, reason: 'synthetic invalid source' }],
+    await expect(repairIndex({ ...await verifyIndex(), missing: [{ path: input, reason: 'synthetic invalid source' }],
       outdated: [], orphaned: [], screeningRejected: [], screeningUnavailable: [], corrupted: [] })).rejects.toThrow(/regular non-symlink file/);
   });
 
