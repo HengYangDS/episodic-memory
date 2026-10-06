@@ -1,3 +1,8 @@
+## Local supply-chain update — 2026-10-06
+
+- Update the locked MCP SDK, Claude Agent SDK, Transformers, SQLite, ONNX, TypeScript, and test dependencies to qualified stable releases. Keep ONNX Web on the stable 1.30.0 line instead of the upstream development build and remove the obsolete Marked types package.
+- Use TypeScript's NodeNext module resolution without relaxing compiler checks. Preserve offline model admission, native database compatibility, and the selected Codex auto-sync hook policy.
+
 ## Local repair — 2026-09-30
 
 - Reconcile continued exchanges by their source line span across manual indexing, background sync, and verification. An assistant continuation now replaces the superseded index row and vector atomically instead of being skipped or duplicated. The rule applies to every supported conversation source, without a harness-specific exception or a model call.
