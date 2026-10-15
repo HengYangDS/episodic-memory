@@ -31062,7 +31062,14 @@ function createSearchAdmission() {
     if (cached2) return !cached2.excluded;
     let fd;
     try {
-      const pathInfo = fs2.lstatSync(file2);
+      let pathInfo;
+      try {
+        pathInfo = fs2.lstatSync(file2);
+      } catch (error62) {
+        if (error62.code !== "ENOENT") throw error62;
+        files.set(file2, { excluded: true });
+        return false;
+      }
       if (!pathInfo.isFile()) throw new Error("Conversation changed during record admission");
       fd = fs2.openSync(file2, fs2.constants.O_RDONLY | fs2.constants.O_NOFOLLOW);
       const initial = fs2.fstatSync(fd);
@@ -31093,7 +31100,7 @@ function createSearchAdmission() {
     verify() {
       assertUnchangedPolicy(policySnapshot);
       for (const [file2, { initial, digest }] of files) {
-        if (digest !== void 0) assertUnchangedSearchPrefix(file2, initial, digest);
+        if (initial !== void 0 && digest !== void 0) assertUnchangedSearchPrefix(file2, initial, digest);
       }
       assertUnchangedPolicy(policySnapshot);
     }
