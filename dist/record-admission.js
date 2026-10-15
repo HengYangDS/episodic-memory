@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import os from 'node:os';
+import zlib from 'node:zlib';
 import { createRequire } from 'node:module';
 import { spawn, spawnSync } from 'node:child_process';
 import { SUMMARIZER_CONTEXT_MARKER } from './constants.js';
@@ -54,6 +55,10 @@ function acquireScannerSlot(signal) {
 }
 /** Scan decoded instruction records without retaining the whole transcript. */
 export function shouldSkipConversation(filePath) {
+    // A compressed transcript's raw bytes cannot carry a readable marker, so this
+    // synchronous scan fails closed; use conversationHasExclusionMarker instead.
+    if (isCompressedConversation(filePath))
+        return true;
     let fd;
     try {
         fd = fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
@@ -69,6 +74,116 @@ export function shouldSkipConversation(filePath) {
         if (fd !== undefined)
             fs.closeSync(fd);
     }
+}
+/** Codex archives finished rollouts as zstd-compressed JSONL. */
+export function isCompressedConversation(file) {
+    return file.endsWith('.jsonl.zst');
+}
+/** Exclusions and archives name a compressed rollout by its uncompressed transcript. */
+export function conversationTranscriptName(file) {
+    return path.basename(file).replace(/\.zst$/, '');
+}
+/** Read a transcript's bytes, decompressed for a compressed rollout, from a pinned descriptor. */
+function conversationByteStream(file, fd, compressed, start = 0, end = Infinity) {
+    // autoClose with a no-op close emits 'close' without closing the caller's descriptor.
+    const raw = fs.createReadStream(file, {
+        fd, autoClose: true, start, ...(end === Infinity ? {} : { end: end - 1 }), highWaterMark: MARKER_SCAN_CHUNK_BYTES,
+        fs: { read: fs.read, close: (_fd, done) => done(null) },
+    });
+    const rawClosed = new Promise(resolve => raw.once('close', () => resolve()));
+    if (!compressed)
+        return { stream: raw, close: async () => { raw.destroy(); await rawClosed; } };
+    const create = zlib.createZstdDecompress;
+    if (!create) {
+        raw.destroy();
+        throw new Error('Compressed conversations require Node.js zstd support');
+    }
+    const output = create();
+    raw.on('error', error => output.destroy(error));
+    raw.pipe(output);
+    return { stream: output, close: async () => { output.destroy(); raw.destroy(); await rawClosed; } };
+}
+/** Same fail-closed marker scan as shouldSkipConversation, for compressed transcripts too. */
+export async function conversationHasExclusionMarker(file) {
+    if (!isCompressedConversation(file))
+        return shouldSkipConversation(file);
+    let fd;
+    try {
+        fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+        const initial = fs.fstatSync(fd);
+        if (!initial.isFile())
+            return true;
+        const excluded = await decompressedHasExclusionMarker(file, fd);
+        assertUnchangedInput(file, initial);
+        return excluded;
+    }
+    catch {
+        return true;
+    }
+    finally {
+        if (fd !== undefined)
+            fs.closeSync(fd);
+    }
+}
+/** Decoded physical lines of a plain or compressed transcript, without retaining the whole file. */
+export async function* conversationLines(file) {
+    const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    let reader;
+    try {
+        reader = conversationByteStream(file, fd, isCompressedConversation(file));
+        const decoder = new TextDecoder('utf-8');
+        let pending = Buffer.alloc(0);
+        for await (const chunk of reader.stream) {
+            pending = Buffer.concat([pending, chunk]);
+            let from = 0;
+            let newline;
+            while ((newline = pending.indexOf(10, from)) !== -1) {
+                yield decoder.decode(pending.subarray(from, newline));
+                from = newline + 1;
+            }
+            pending = pending.subarray(from);
+            if (pending.length > 64 * 1024 * 1024)
+                throw new Error('Conversation record exceeds admission byte limit');
+        }
+        if (pending.length)
+            yield decoder.decode(pending);
+    }
+    finally {
+        await reader?.close();
+        fs.closeSync(fd);
+    }
+}
+async function decompressedHasExclusionMarker(file, fd) {
+    const decoder = new TextDecoder('utf-8', { fatal: true });
+    let pending = Buffer.alloc(0);
+    const reader = conversationByteStream(file, fd, true);
+    try {
+        for await (const chunk of reader.stream) {
+            pending = Buffer.concat([pending, chunk]);
+            let newline;
+            while ((newline = pending.indexOf(10)) !== -1) {
+                if (lineHasExclusionMarker(decoder.decode(pending.subarray(0, newline))))
+                    return true;
+                pending = pending.subarray(newline + 1);
+            }
+            if (pending.length > 64 * 1024 * 1024)
+                throw new Error('Conversation record exceeds admission byte limit');
+        }
+        return pending.length > 0 && lineHasExclusionMarker(decoder.decode(pending));
+    }
+    finally {
+        await reader.close();
+    }
+}
+function lineHasExclusionMarker(line) {
+    let text;
+    try {
+        text = instructionText(JSON.parse(line));
+    }
+    catch {
+        text = line;
+    } // Preserve conservative handling of legacy raw transcripts.
+    return EXCLUSION_MARKERS.some(marker => text.includes(marker));
 }
 function instructionText(record) {
     if (!object(record))
@@ -90,24 +205,14 @@ function instructionText(record) {
     return content.filter(part => object(part) && ['text', 'input_text'].includes(String(part.type))
         && typeof part.text === 'string').map(part => part.text).join('\n');
 }
-function descriptorHasExclusionMarker(fd, byteLimit = Infinity, digest) {
+function descriptorHasExclusionMarker(fd, byteLimit = Infinity, digest, start = 0) {
     if (!fs.fstatSync(fd).isFile())
         throw new Error('Conversation input must be a regular file');
     const buffer = Buffer.allocUnsafe(MARKER_SCAN_CHUNK_BYTES);
     const decoder = new TextDecoder('utf-8', { fatal: true });
     let pending = Buffer.alloc(0);
-    let position = 0;
-    const excluded = (bytes) => {
-        const line = decoder.decode(bytes);
-        let text;
-        try {
-            text = instructionText(JSON.parse(line));
-        }
-        catch {
-            text = line;
-        } // Preserve conservative handling of legacy raw transcripts.
-        return EXCLUSION_MARKERS.some(marker => text.includes(marker));
-    };
+    let position = start;
+    const excluded = (bytes) => lineHasExclusionMarker(decoder.decode(bytes));
     let count;
     while (position < byteLimit && (count = fs.readSync(fd, buffer, 0, Math.min(buffer.length, byteLimit - position), position)) > 0) {
         position += count;
@@ -134,6 +239,26 @@ function assertUnchangedInput(file, initial) {
         initial.size !== current.size || initial.mtimeMs !== current.mtimeMs || initial.ctimeMs !== current.ctimeMs) {
         throw new Error('Conversation changed during record admission');
     }
+}
+/** A live transcript may grow while it is admitted; its admitted bytes must not change. */
+function assertGrownInput(file, initial, end) {
+    const current = fs.lstatSync(file);
+    if (!current.isFile() || initial.dev !== current.dev || initial.ino !== current.ino || current.size < end) {
+        throw new Error('Conversation changed during record admission');
+    }
+}
+/** Appends cannot be told from rewrites by metadata, so re-read the admitted byte range. */
+function assertUnchangedRange(fd, start, end, expected) {
+    const digest = crypto.createHash('sha256');
+    const buffer = Buffer.allocUnsafe(MARKER_SCAN_CHUNK_BYTES);
+    let position = start;
+    let count;
+    while (position < end && (count = fs.readSync(fd, buffer, 0, Math.min(buffer.length, end - position), position)) > 0) {
+        digest.update(buffer.subarray(0, count));
+        position += count;
+    }
+    if (position !== end || digest.digest('hex') !== expected)
+        throw new Error('Conversation changed during record admission');
 }
 function assertUnchangedSearchPrefix(file, initial, expectedDigest) {
     // A live transcript may grow after the search snapshot. Rehash the pinned
@@ -690,22 +815,61 @@ function filterRecord(line, number, policy, transcript, sessionId) {
     }
     return line;
 }
+function observeRecordIdentity(line, identity, policy) {
+    if (identity.identitySeen)
+        return;
+    let recordSession;
+    try {
+        recordSession = sessionFromRecord(JSON.parse(line));
+    }
+    catch { /* Parser owns malformed records. */ }
+    if (!recordSession)
+        return;
+    if (identity.sessionId && recordSession !== identity.sessionId &&
+        (excludedSession(policy, identity.sessionId) || excludedSession(policy, recordSession))) {
+        throw new Error('Record exclusion session identity mismatch');
+    }
+    identity.sessionId = recordSession;
+    identity.identitySeen = true;
+}
 /** Own one marker preflight, descriptor, policy and scanner across sequential cursors. */
-function openRecordAdmission(file, policy) {
+function openRecordAdmission(file, policy, options = {}) {
+    const compressed = isCompressedConversation(file);
+    if (compressed && (options.resume || options.snapshot))
+        throw new Error('Compressed conversations are admitted whole');
+    const transcript = conversationTranscriptName(file);
+    const start = options.resume?.offset ?? 0;
     const policySnapshot = JSON.stringify(policy);
     const checkPolicy = policyGuard(policySnapshot);
     const input = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
     let initial;
+    let end = Infinity;
+    // A compressed rollout is decompressed for its marker preflight when reading starts.
     let excluded;
+    // A snapshot tolerates appends, so the preflight and the stream must read identical bytes.
+    let preflightDigest;
     let screener;
+    const checkInput = () => options.snapshot ? assertGrownInput(file, initial, end) : assertUnchangedInput(file, initial);
     try {
         initial = fs.fstatSync(input);
-        excluded = descriptorHasExclusionMarker(input);
-        assertUnchangedInput(file, initial);
+        if (options.snapshot) {
+            end = initial.size;
+            options.onSnapshot?.(end);
+        }
+        if (options.resume && (options.resume.dev !== initial.dev || options.resume.ino !== initial.ino || start > initial.size)) {
+            throw new Error('Conversation changed during record admission');
+        }
+        if (!compressed) {
+            const digest = options.snapshot ? crypto.createHash('sha256') : undefined;
+            excluded = descriptorHasExclusionMarker(input, end, digest, start);
+            if (digest && !excluded)
+                preflightDigest = digest.digest('hex');
+        }
+        checkInput();
         checkPolicy();
-        if (!excluded)
+        if (!excluded && !options.skipScreening)
             screener = createRecordScreener(policy, () => {
-                assertUnchangedInput(file, initial);
+                checkInput();
                 checkPolicy();
             });
     }
@@ -725,13 +889,14 @@ function openRecordAdmission(file, policy) {
             if (closed || active)
                 throw new Error('Conversation admission is closed or already in use');
             active = cursor;
-            let stream;
-            let streamClosed;
+            let reader;
             const decoder = new TextDecoder('utf-8', { fatal: true });
             let pending = Buffer.alloc(0);
-            let sessionId = sessionFromPath(file);
-            let primaryIdentitySeen = false;
-            let number = 0;
+            const identity = options.resume
+                ? { ...options.resume.identity }
+                : { sessionId: sessionFromPath(file), identitySeen: false };
+            let number = options.resume?.line ?? 0;
+            const range = options.snapshot ? crypto.createHash('sha256') : undefined;
             const batch = [];
             const batchLimit = policy?.screening ? batchRecords : 1;
             let batchBytes = 0;
@@ -739,28 +904,17 @@ function openRecordAdmission(file, policy) {
                 number++;
                 const crlf = terminated && bytes.at(-1) === 13;
                 const line = decoder.decode(crlf ? bytes.subarray(0, -1) : bytes);
-                let recordSession;
-                try {
-                    recordSession = sessionFromRecord(JSON.parse(line));
-                }
-                catch { /* Parser owns malformed records. */ }
-                if (recordSession && !primaryIdentitySeen) {
-                    if (sessionId && recordSession !== sessionId && (excludedSession(policy, sessionId) || excludedSession(policy, recordSession))) {
-                        throw new Error('Record exclusion session identity mismatch');
-                    }
-                    sessionId = recordSession;
-                    primaryIdentitySeen = true;
-                }
+                observeRecordIdentity(line, identity, policy);
                 const filtered = number >= startLine && number <= endLine
-                    ? filterRecord(line, number, policy, path.basename(file), sessionId) : '';
+                    ? filterRecord(line, number, policy, transcript, identity.sessionId) : '';
                 return { line: filtered, ending: terminated ? (crlf ? '\r\n' : '\n') : '' };
             };
             const flush = async function* () {
                 if (batch.length === 0)
                     return;
-                if (policy?.screening) {
+                if (policy?.screening && screener) {
                     await screener?.scanMany(batch.map(record => record.line));
-                    assertUnchangedInput(file, initial);
+                    checkInput();
                     checkPolicy();
                 }
                 for (const record of batch)
@@ -769,20 +923,21 @@ function openRecordAdmission(file, policy) {
                 batchBytes = 0;
             };
             try {
-                assertUnchangedInput(file, initial);
+                checkInput();
                 checkPolicy();
+                if (excluded === undefined)
+                    excluded = await decompressedHasExclusionMarker(file, input);
                 if (excluded)
+                    return;
+                if (start >= end)
                     return;
                 // A cursor destroys its stream, but only this context closes the pinned
                 // descriptor. Native stream close waits for any pending read to finish.
-                stream = fs.createReadStream(file, {
-                    fd: input, autoClose: true, start: 0,
-                    fs: { read: fs.read, close: (_fd, done) => done(null) },
-                });
-                streamClosed = new Promise(resolve => stream.once('close', resolve));
-                for await (const chunk of stream) {
-                    assertUnchangedInput(file, initial);
+                reader = conversationByteStream(file, input, compressed, start, end);
+                for await (const chunk of reader.stream) {
+                    checkInput();
                     checkPolicy();
+                    range?.update(chunk);
                     pending = Buffer.concat([pending, chunk]);
                     let newline;
                     while ((newline = pending.indexOf(10)) !== -1) {
@@ -807,14 +962,18 @@ function openRecordAdmission(file, policy) {
                     batchBytes += Buffer.byteLength(record.line);
                 }
                 yield* flush();
-                assertUnchangedInput(file, initial);
+                checkInput();
                 checkPolicy();
+                if (range) {
+                    const streamed = range.digest('hex');
+                    if (preflightDigest !== undefined && streamed !== preflightDigest) {
+                        throw new Error('Conversation changed during record admission');
+                    }
+                    assertUnchangedRange(input, start, end, streamed);
+                }
             }
             finally {
-                if (stream) {
-                    stream.destroy();
-                    await streamClosed;
-                }
+                await reader?.close();
                 active = undefined;
             }
         })();
@@ -844,8 +1003,8 @@ function openRecordAdmission(file, policy) {
     };
 }
 /** Keep byte delimiters and physical line coordinates stable in derived copies. */
-async function* admittedRecords(file, policy, startLine = 1, endLine = Infinity, batchRecords = SCREENING_BATCH_RECORDS) {
-    const admission = openRecordAdmission(file, policy);
+async function* admittedRecords(file, policy, startLine = 1, endLine = Infinity, batchRecords = SCREENING_BATCH_RECORDS, options = {}) {
+    const admission = openRecordAdmission(file, policy, options);
     try {
         yield* admission.records(startLine, endLine, batchRecords);
     }
@@ -854,10 +1013,10 @@ async function* admittedRecords(file, policy, startLine = 1, endLine = Infinity,
     }
 }
 /** Give detection and parsing rewound, admitted cursors without caching their prefix. */
-export function openConversationAdmission(file, policy = readRecordExclusions()) {
+export function openConversationAdmission(file, policy = readRecordExclusions(), options = {}) {
     if (!fs.lstatSync(file).isFile())
         throw new Error('Conversation input must be a regular non-symlink file');
-    const admission = openRecordAdmission(file, policy);
+    const admission = openRecordAdmission(file, policy, { skipScreening: options.skipScreening });
     return {
         async *lines(batchRecords = SCREENING_BATCH_RECORDS) {
             for await (const record of admission.records(1, Infinity, batchRecords))
@@ -911,11 +1070,285 @@ export function admitExchange(exchange, policy = readRecordExclusions()) {
         screener.close();
     }
 }
+/**
+ * When the record policy file last changed; 0 when there is none. The change
+ * time also covers a replacement that kept an older modification time.
+ */
+export function recordExclusionsChangedMs() {
+    try {
+        const info = fs.lstatSync(path.join(getSuperpowersDir(), 'record-exclusions.json'));
+        return Math.max(info.mtimeMs, info.ctimeMs);
+    }
+    catch (error) {
+        if (error.code === 'ENOENT')
+            return 0;
+        throw error;
+    }
+}
+/** Deterministic refusals of a conversation's current bytes under the current policy. */
+const SCREENING_REFUSALS = new Set([
+    'Record content rejected by screening',
+    'Record screening byte limit exceeded',
+    'Record screening nesting limit exceeded',
+]);
+/** True when admission refused the content itself, so retrying unchanged bytes cannot succeed. */
+export function isScreeningRefusal(error) {
+    return error instanceof Error && SCREENING_REFUSALS.has(error.message);
+}
+/** Exclusions bind a session and transcript; either identity of a source counts as named. */
+function policyNamesConversation(policy, source) {
+    const transcript = conversationTranscriptName(source);
+    const session = sessionFromPath(source);
+    const named = (row) => row.transcript === transcript || row.session_id === session;
+    return policy.exchanges.some(named) || policy.tool_calls.some(named);
+}
+/**
+ * An archive reflects the current policy's filtering when it was written after
+ * the policy last changed, or when that policy names neither of its identities.
+ * Admission renames and re-times the archive, refreshing a ctime that utimes
+ * cannot set back. Search output is screened again at the read boundary in every case.
+ */
+function admittedUnderPolicy(archive, source, policy, policyChangedMs) {
+    return !policy || archive.ctimeMs >= policyChangedMs || !policyNamesConversation(policy, source);
+}
+/**
+ * Admission stamps an archive with its source's mtime, rounded up to a whole
+ * millisecond. An ordinary write keeps a sub-millisecond part, so the stamp
+ * also tells an admitted archive from one written by anything else.
+ */
+function carriesAdmissionStamp(archive, original) {
+    return Math.abs(archive.mtimeMs - Math.ceil(original.mtimeMs)) < 0.001;
+}
+/**
+ * True when every record of an archive was screened under the current policy.
+ * Only admission stamps an archive after it changed, and every admission that
+ * stamps it has screened each of its records under the policy it snapshotted;
+ * an archive written before the policy last changed may never have been screened.
+ */
+function screenedUnderPolicy(archive, policy, policyChangedMs) {
+    return !policy?.screening || (archive.ctimeMs >= policyChangedMs && Number.isInteger(archive.mtimeMs));
+}
+/** True when an existing archive already holds the admitted form of the source's current bytes. */
+export function archiveIsCurrent(source, destination, policy = readRecordExclusions(), policyChangedMs = recordExclusionsChangedMs()) {
+    try {
+        if (path.resolve(source) === path.resolve(destination))
+            return false;
+        const original = fs.lstatSync(source);
+        const archive = fs.lstatSync(destination);
+        if (!original.isFile() || !archive.isFile() || original.dev === archive.dev && original.ino === archive.ino)
+            return false;
+        // Any other archive time means the source changed or something else wrote the archive.
+        if (!carriesAdmissionStamp(archive, original))
+            return false;
+        // Without a policy an uncompressed archive is an exact copy of its source.
+        if (!policy && !isCompressedConversation(source))
+            return archive.size === original.size;
+        return admittedUnderPolicy(archive, source, policy, policyChangedMs);
+    }
+    catch {
+        return false;
+    }
+}
+/**
+ * True when every record of this archive copy was screened under the current
+ * policy. Readers that index such an archive need not screen it again; search
+ * output is still screened at the read boundary.
+ */
+export function archiveScreenedUnderPolicy(archive, archiveRoot, policy = readRecordExclusions(), policyChangedMs = recordExclusionsChangedMs()) {
+    try {
+        const relative = path.relative(fs.realpathSync(archiveRoot), fs.realpathSync(archive));
+        if (!relative || relative.startsWith('..') || path.isAbsolute(relative))
+            return false;
+        const info = fs.lstatSync(archive);
+        return info.isFile() && screenedUnderPolicy(info, policy, policyChangedMs);
+    }
+    catch {
+        return false;
+    }
+}
+async function* physicalLines(file, fd) {
+    const reader = conversationByteStream(file, fd, false);
+    let pending = Buffer.alloc(0);
+    try {
+        for await (const chunk of reader.stream) {
+            pending = Buffer.concat([pending, chunk]);
+            let from = 0;
+            let newline;
+            while ((newline = pending.indexOf(10, from)) !== -1) {
+                yield { bytes: pending.subarray(from, newline), terminated: true, length: newline + 1 - from };
+                from = newline + 1;
+            }
+            pending = pending.subarray(from);
+            if (pending.length > 64 * 1024 * 1024)
+                throw new Error('Conversation record exceeds admission byte limit');
+        }
+        if (pending.length)
+            yield { bytes: pending, terminated: false, length: pending.length };
+    }
+    finally {
+        await reader.close();
+    }
+}
+/**
+ * Confirm that an archive is the admitted form of its source's leading lines.
+ * The archive was screened under the current policy, so a byte-identical line
+ * was screened when it was admitted; any other line must equal the current
+ * filtering of its record and carry no opt-out marker. An unterminated archive
+ * tail is admitted again from the source.
+ */
+async function verifyAdmittedPrefix(source, archive, policy) {
+    const transcript = conversationTranscriptName(source);
+    const decoder = new TextDecoder('utf-8', { fatal: true });
+    const identity = { sessionId: sessionFromPath(source), identitySeen: false };
+    let sourceFd;
+    let archiveFd;
+    try {
+        sourceFd = fs.openSync(source, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+        archiveFd = fs.openSync(archive, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+        const sourceStats = fs.fstatSync(sourceFd);
+        if (!sourceStats.isFile() || !fs.fstatSync(archiveFd).isFile())
+            return undefined;
+        const originals = physicalLines(source, sourceFd);
+        let line = 0;
+        let offset = 0;
+        let archiveOffset = 0;
+        try {
+            for await (const archived of physicalLines(archive, archiveFd)) {
+                if (!archived.terminated)
+                    break;
+                const next = await originals.next();
+                if (next.done || !next.value.terminated)
+                    return undefined;
+                const original = next.value;
+                line++;
+                const crlf = original.bytes.at(-1) === 13;
+                const text = decoder.decode(crlf ? original.bytes.subarray(0, -1) : original.bytes);
+                observeRecordIdentity(text, identity, policy);
+                if (!original.bytes.equals(archived.bytes)) {
+                    const expected = Buffer.from(filterRecord(text, line, policy, transcript, identity.sessionId) + (crlf ? '\r' : ''));
+                    if (!expected.equals(archived.bytes) || lineHasExclusionMarker(text))
+                        return undefined;
+                }
+                offset += original.length;
+                archiveOffset += archived.length;
+            }
+        }
+        finally {
+            await originals.return(undefined);
+        }
+        return { archiveOffset, resume: { offset, line, identity, dev: sourceStats.dev, ino: sourceStats.ino } };
+    }
+    catch (error) {
+        if (error instanceof Error && error.message === 'Record exclusion session identity mismatch')
+            throw error;
+        // Unreadable or undecodable input is left to full admission, which reports it.
+        return undefined;
+    }
+    finally {
+        if (sourceFd !== undefined)
+            fs.closeSync(sourceFd);
+        if (archiveFd !== undefined)
+            fs.closeSync(archiveFd);
+    }
+}
+function suffixHasExclusionMarker(source, offset) {
+    let fd;
+    try {
+        fd = fs.openSync(source, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+        return descriptorHasExclusionMarker(fd, Infinity, undefined, offset);
+    }
+    catch {
+        return true;
+    }
+    finally {
+        if (fd !== undefined)
+            fs.closeSync(fd);
+    }
+}
+/** Admit only what an append-only source added after its verified archive prefix. */
+async function appendAdmittedConversation(source, destination, policy, policySnapshot) {
+    const prefix = await verifyAdmittedPrefix(source, destination, policy);
+    if (!prefix)
+        return undefined;
+    const initial = fs.statSync(source);
+    const archive = fs.lstatSync(destination);
+    if (initial.dev !== prefix.resume.dev || initial.ino !== prefix.resume.ino)
+        return undefined;
+    if (prefix.resume.offset === initial.size && prefix.archiveOffset === archive.size) {
+        // Nothing was appended; record that the archive reflects these bytes.
+        fs.utimesSync(destination, initial.atimeMs / 1000, Math.ceil(initial.mtimeMs) / 1000);
+        return false;
+    }
+    // An opt-out marker anywhere excludes the whole conversation; keep the previous archive.
+    if (suffixHasExclusionMarker(source, prefix.resume.offset))
+        return false;
+    const parent = prepareArchiveParent(path.dirname(path.resolve(destination)));
+    const parentIdentity = fs.statSync(parent);
+    destination = path.join(parent, path.basename(destination));
+    const temp = destination + '.tmp.' + process.pid + '.' + crypto.randomUUID();
+    // The clone holds only already-admitted bytes; every appended record is screened first.
+    fs.copyFileSync(destination, temp, fs.constants.COPYFILE_EXCL | fs.constants.COPYFILE_FICLONE);
+    try {
+        fs.chmodSync(temp, 0o600);
+        fs.truncateSync(temp, prefix.archiveOffset);
+        let admittedEnd = Infinity;
+        const fd = fs.openSync(temp, 'a');
+        try {
+            for await (const record of admittedRecords(source, policy, 1, Infinity, SCREENING_BATCH_RECORDS, { resume: prefix.resume, snapshot: true, onSnapshot: end => { admittedEnd = end; } })) {
+                fs.writeFileSync(fd, Buffer.from(record.line + record.ending));
+            }
+            fs.fsyncSync(fd);
+        }
+        finally {
+            fs.closeSync(fd);
+        }
+        assertUnchangedPolicy(policySnapshot);
+        // Records appended during admission are left for the next admission, unless one opts out.
+        if (suffixHasExclusionMarker(source, admittedEnd))
+            throw new Error('Conversation changed during record admission');
+        const current = fs.lstatSync(destination);
+        if (!current.isFile() || current.dev !== archive.dev || current.ino !== archive.ino || current.size !== archive.size) {
+            throw new Error('Archive changed during record admission');
+        }
+        const currentParent = fs.lstatSync(parent);
+        if (!currentParent.isDirectory() || currentParent.dev !== parentIdentity.dev || currentParent.ino !== parentIdentity.ino) {
+            throw new Error('Archive parent changed during record admission');
+        }
+        fs.renameSync(temp, destination);
+        fs.utimesSync(destination, initial.atimeMs / 1000, Math.ceil(initial.mtimeMs) / 1000);
+        return true;
+    }
+    finally {
+        if (fs.existsSync(temp))
+            fs.unlinkSync(temp);
+    }
+}
 /** Publish only admitted bytes. Never write an unfiltered temporary copy. */
 export async function archiveAdmittedConversation(source, destination, policy = readRecordExclusions()) {
     const policySnapshot = JSON.stringify(policy);
     assertUnchangedPolicy(policySnapshot);
-    if (shouldSkipConversation(source))
+    // An unchanged archive needs neither a marker scan nor screening.
+    const policyChangedMs = recordExclusionsChangedMs();
+    if (archiveIsCurrent(source, destination, policy, policyChangedMs))
+        return false;
+    const compressed = isCompressedConversation(source);
+    if (!compressed && path.resolve(source) !== path.resolve(destination)) {
+        let eligible = false;
+        try {
+            const original = fs.lstatSync(source);
+            const archive = fs.lstatSync(destination);
+            // Only a prefix already screened under this policy may be kept without screening it again.
+            eligible = original.isFile() && archive.isFile() && (original.dev !== archive.dev || original.ino !== archive.ino) &&
+                admittedUnderPolicy(archive, source, policy, policyChangedMs) && screenedUnderPolicy(archive, policy, policyChangedMs);
+        }
+        catch { /* A missing or irregular archive is admitted whole. */ }
+        if (eligible) {
+            const appended = await appendAdmittedConversation(source, destination, policy, policySnapshot);
+            if (appended !== undefined)
+                return appended;
+        }
+    }
+    if (await conversationHasExclusionMarker(source))
         return false;
     if (path.resolve(source) === path.resolve(destination))
         throw new Error('Source and derived archive must be distinct');
@@ -929,8 +1362,6 @@ export async function archiveAdmittedConversation(source, destination, policy = 
             throw new Error('Source and derived archive must be distinct regular files');
         }
     }
-    if (!policy && target && target.mtimeMs >= original.mtimeMs && target.size === original.size)
-        return false;
     const initial = fs.statSync(source);
     const parent = prepareArchiveParent(path.dirname(path.resolve(destination)));
     const parentIdentity = fs.statSync(parent);
@@ -938,8 +1369,10 @@ export async function archiveAdmittedConversation(source, destination, policy = 
     const temp = destination + '.tmp.' + process.pid + '.' + crypto.randomUUID();
     const fd = fs.openSync(temp, 'wx', 0o600);
     const hash = crypto.createHash('sha256');
+    let admittedEnd = Infinity;
     try {
-        for await (const record of admittedRecords(source, policy)) {
+        // A live transcript is admitted up to its size at open; later appends follow next time.
+        for await (const record of admittedRecords(source, policy, 1, Infinity, SCREENING_BATCH_RECORDS, { snapshot: !compressed, onSnapshot: end => { admittedEnd = end; } })) {
             const bytes = Buffer.from(record.line + record.ending);
             hash.update(bytes);
             fs.writeFileSync(fd, bytes);
@@ -954,17 +1387,28 @@ export async function archiveAdmittedConversation(source, destination, policy = 
     fs.closeSync(fd);
     try {
         const final = fs.statSync(source);
-        if (initial.dev !== final.dev || initial.ino !== final.ino || initial.size !== final.size || initial.mtimeMs !== final.mtimeMs) {
+        if (initial.dev !== final.dev || initial.ino !== final.ino ||
+            (compressed ? initial.size !== final.size || initial.mtimeMs !== final.mtimeMs : final.size < initial.size)) {
             throw new Error('Conversation changed during record admission');
         }
         if (fs.existsSync(destination)) {
             const existing = crypto.createHash('sha256');
             for await (const chunk of fs.createReadStream(destination))
                 existing.update(chunk);
-            if (existing.digest('hex') === hash.digest('hex'))
+            if (existing.digest('hex') === hash.digest('hex')) {
+                // Same admitted bytes: record that the archive reflects this source and policy.
+                fs.utimesSync(destination, initial.atimeMs / 1000, Math.ceil(initial.mtimeMs) / 1000);
                 return false;
+            }
         }
-        assertUnchangedInput(source, original);
+        if (compressed)
+            assertUnchangedInput(source, original);
+        else {
+            assertGrownInput(source, original, original.size);
+            // Records appended during admission are left for the next admission, unless one opts out.
+            if (suffixHasExclusionMarker(source, admittedEnd))
+                throw new Error('Conversation changed during record admission');
+        }
         assertUnchangedPolicy(policySnapshot);
         const currentParent = fs.lstatSync(parent);
         if (!currentParent.isDirectory() || currentParent.dev !== parentIdentity.dev || currentParent.ino !== parentIdentity.ino) {

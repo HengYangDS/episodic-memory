@@ -179,6 +179,21 @@ export function initDatabase(): Database.Database {
     )
   `);
 
+  // Sync stages that screening refused for a file's exact state under an exact
+  // policy. Retrying unchanged bytes cannot succeed, so sync skips them until
+  // the file or the policy changes.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS sync_refusals (
+      stage TEXT NOT NULL,
+      path TEXT NOT NULL,
+      state TEXT NOT NULL,
+      policy TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      refused_at INTEGER NOT NULL,
+      PRIMARY KEY (stage, path)
+    )
+  `);
+
   // Run migrations first
   migrateSchema(db);
 

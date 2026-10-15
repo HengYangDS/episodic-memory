@@ -59,8 +59,20 @@ export declare function getConversationSourceDirs(only?: ConversationSourceHarne
  * the set, at any depth. Top-level project skipping at the caller is the
  * usual case; this parameter handles nested directories like `subagents/`
  * inside session UUIDs (#80).
+ *
+ * `includeCompressed` also returns Codex's zstd-compressed `.jsonl.zst`
+ * rollouts, for callers that can read them.
  */
-export declare function findJsonlFiles(dir: string, excludedDirNames?: ReadonlySet<string>): string[];
+export declare function findJsonlFiles(dir: string, excludedDirNames?: ReadonlySet<string>, options?: {
+    includeCompressed?: boolean;
+}): string[];
+/**
+ * Codex moves a finished rollout from `sessions/YYYY/MM/DD/` to a flat
+ * `archived_sessions/` directory, often compressing it. Map such a flat
+ * rollout back to the dated archive path it had before it moved, so a moved
+ * session keeps one archive identity. Returns null for any other file name.
+ */
+export declare function archivedRolloutRelativePath(fileName: string): string | null;
 /**
  * statSync that follows symlinks but returns null instead of throwing when
  * the entry cannot be stat'ed — a dangling symlink (e.g. left behind by a

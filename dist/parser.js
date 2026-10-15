@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
-import { openConversationAdmission } from './record-admission.js';
+import { archiveScreenedUnderPolicy, openConversationAdmission, readRecordExclusions } from './record-admission.js';
 async function detectConversationHarness(rl) {
     for await (const line of rl) {
         if (!line.trim())
@@ -50,8 +50,13 @@ async function detectConversationHarness(rl) {
     }
     return 'claude';
 }
-export async function parseConversation(filePath, projectName, archivePath) {
-    const admission = openConversationAdmission(filePath);
+export async function parseConversation(filePath, projectName, archivePath, options = {}) {
+    // An archive copy under the caller's archive root that admission wrote under
+    // the current policy was already screened record by record.
+    const policy = readRecordExclusions();
+    const admission = openConversationAdmission(filePath, policy, {
+        skipScreening: options.archiveRoot !== undefined && archiveScreenedUnderPolicy(filePath, options.archiveRoot, policy),
+    });
     try {
         const harness = await detectConversationHarness(admission.lines(1));
         const lines = admission.lines();

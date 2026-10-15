@@ -5,7 +5,7 @@ import { parseConversation } from './parser.js';
 import { getAllExchanges, getExchangesNeedingIndex } from './db.js';
 import { getArchiveDir, getDbPath, getExcludedProjects, findJsonlFiles, statIfExists } from './paths.js';
 import { isErroredSentinel } from './summary-sentinel.js';
-import { readRecordExclusions } from './record-admission.js';
+import { isScreeningRefusal, readRecordExclusions } from './record-admission.js';
 import { getMaxMessageBytes, isOversizeExchange } from './message-size.js';
 function positiveLimit(value, name) {
     if (value === undefined)
@@ -148,9 +148,7 @@ export async function verifyIndex(options = {}) {
         }
         catch (error) {
             const message = error instanceof Error ? error.message : String(error);
-            if (message === 'Record content rejected by screening' ||
-                message === 'Record screening byte limit exceeded' ||
-                message === 'Record screening nesting limit exceeded') {
+            if (isScreeningRefusal(error)) {
                 result.screeningRejected.push({ path: conversationPath });
             }
             else if (message === 'Record screening unavailable') {

@@ -4,15 +4,44 @@ export interface SyncResult {
     skipped: number;
     indexed: number;
     summarized: number;
+    /** Changed transcripts left for a later run by the whole-operation budget. */
+    deferred: number;
+    /** Changed transcripts whose single admission would exceed the per-file byte limit. */
+    deferredOversize: number;
+    /** Transcripts whose current bytes screening refuses; retried once they or the policy change. */
+    refused: number;
     errors: Array<{
         file: string;
         error: string;
     }>;
 }
+/**
+ * Bounds for one whole sync operation. Admission screens every new record, so
+ * an unbounded run over a large backlog can occupy the scanner for hours.
+ * Unset limits are unbounded, which preserves the previous behavior.
+ */
+export interface SyncLimits {
+    /** Transcripts admitted (copied or extended) in this run. */
+    maxFiles?: number;
+    /** Estimated transcript bytes admitted in this run. */
+    maxBytes?: number;
+    /** Defer any transcript whose own admission would read more than this. */
+    maxFileBytes?: number;
+    /** Epoch milliseconds after which no new admission or indexing starts. */
+    deadlineMs?: number;
+}
+/** One budget shared by every source directory of a sync run. */
+export interface SyncBudget {
+    readonly limits: SyncLimits;
+    files: number;
+    bytes: number;
+}
+export declare function createSyncBudget(limits?: SyncLimits): SyncBudget;
 export interface SyncOptions {
     skipIndex?: boolean;
     skipSummaries?: boolean;
     summaryLimit?: number;
+    budget?: SyncBudget;
 }
 /**
  * Derive sync options from the process environment.

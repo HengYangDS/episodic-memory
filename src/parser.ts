@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { ConversationExchange, ConversationHarness, ToolCall } from './types.js';
 import crypto from 'crypto';
-import { openConversationAdmission } from './record-admission.js';
+import { archiveScreenedUnderPolicy, openConversationAdmission, readRecordExclusions } from './record-admission.js';
 
 interface JSONLMessage {
   type: string;
@@ -145,9 +145,15 @@ async function detectConversationHarness(rl: AsyncIterable<string>): Promise<Con
 export async function parseConversation(
   filePath: string,
   projectName: string,
-  archivePath: string
+  archivePath: string,
+  options: { archiveRoot?: string } = {}
 ): Promise<ConversationExchange[]> {
-  const admission = openConversationAdmission(filePath);
+  // An archive copy under the caller's archive root that admission wrote under
+  // the current policy was already screened record by record.
+  const policy = readRecordExclusions();
+  const admission = openConversationAdmission(filePath, policy, {
+    skipScreening: options.archiveRoot !== undefined && archiveScreenedUnderPolicy(filePath, options.archiveRoot, policy),
+  });
   try {
     const harness = await detectConversationHarness(admission.lines(1));
     const lines = admission.lines();

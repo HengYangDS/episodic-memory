@@ -1,4 +1,4 @@
-import { buildSyncOptionsFromEnv, syncConversations } from './sync.js';
+import { buildSyncOptionsFromEnv, createSyncBudget, syncConversations, type SyncLimits } from './sync.js';
 import {
   ConversationSourceHarness,
   getArchiveDir,
@@ -43,22 +43,28 @@ if (process.env.EPISODIC_MEMORY_DISABLE_AUTO_SYNC === '1' && args.includes('--ba
 if (args.includes('--help') || args.includes('-h')) {
   console.log(`
 Usage: episodic-memory sync [--background] [--only claude|codex|opencode] [--summary-limit N]
+                            [--max-files N] [--max-bytes N] [--max-file-bytes N] [--max-seconds N]
 
 Sync conversations from Claude Code, Codex, and opencode transcript sources to archive and index them.
 
 This command:
 1. Exports opencode sessions from its SQLite database when available
-2. Copies new or updated .jsonl files to conversation archive
+2. Copies new or updated .jsonl files (and Codex .jsonl.zst rollouts) to conversation archive
 3. Generates embeddings for semantic search
 4. Updates the search index
 
-Only processes files that are new or have been modified since last sync.
-Safe to run multiple times - subsequent runs are fast no-ops.
+Only processes files that are new or have been modified since last sync, newest
+first. An appended transcript is screened only for its new records. Bounds stop
+starting new work; deferred transcripts are processed by the next sync.
 
 OPTIONS:
   --background        Run sync in background (for hooks, returns immediately)
   --only <harness>    Limit sync to claude, codex, or opencode
-  --summary-limit N   Max summaries to generate per source this run (default: 10)
+  --summary-limit N   Max summaries to generate per source this run (default: 10; background default: 0)
+  --max-files N       Max transcripts to admit this run (background default: 50)
+  --max-bytes N       Max transcript bytes to admit this run (background default: 256 MiB)
+  --max-file-bytes N  Defer a transcript whose admission exceeds N bytes (background default: 128 MiB)
+  --max-seconds N     Start no new admission after N seconds (background default: 300)
 
 EXAMPLES:
   # Sync all new conversations
@@ -108,15 +114,15 @@ function parseOnlyHarness(): ConversationSourceHarness[] | undefined {
   return harnesses as ConversationSourceHarness[];
 }
 
-function parseSummaryLimit(): number | undefined {
+function parseNonNegativeOption(name: string): number | undefined {
   const raw = (() => {
-    const eq = args.find(arg => arg.startsWith('--summary-limit='));
-    if (eq) return eq.slice('--summary-limit='.length);
-    const idx = args.indexOf('--summary-limit');
+    const eq = args.find(arg => arg.startsWith(`${name}=`));
+    if (eq) return eq.slice(name.length + 1);
+    const idx = args.indexOf(name);
     if (idx !== -1) {
       const value = args[idx + 1];
       if (!value || value.startsWith('--')) {
-        console.error('Invalid --summary-limit value: expected a non-negative integer.');
+        console.error(`Invalid ${name} value: expected a non-negative integer.`);
         process.exit(1);
       }
       return value;
@@ -125,16 +131,50 @@ function parseSummaryLimit(): number | undefined {
   })();
   if (!raw) return undefined;
 
-  const parsed = Number.parseInt(raw, 10);
-  if (!Number.isInteger(parsed) || parsed < 0) {
-    console.error(`Invalid --summary-limit value: ${raw}. Expected a non-negative integer.`);
+  const parsed = Number(raw);
+  if (!/^\d+$/.test(raw) || !Number.isSafeInteger(parsed)) {
+    console.error(`Invalid ${name} value: ${raw}. Expected a non-negative integer.`);
     process.exit(1);
   }
   return parsed;
 }
 
+function parseSummaryLimit(): number | undefined {
+  return parseNonNegativeOption('--summary-limit');
+}
+
+/**
+ * Whole-operation bounds. A hook-launched background run is bounded by default
+ * so a large backlog drains over several sessions instead of one unbounded run.
+ */
+function parseSyncLimits(background: boolean): SyncLimits {
+  const maxFiles = parseNonNegativeOption('--max-files');
+  const maxBytes = parseNonNegativeOption('--max-bytes');
+  const maxFileBytes = parseNonNegativeOption('--max-file-bytes');
+  const maxSeconds = parseNonNegativeOption('--max-seconds');
+  const defaults: Partial<typeof BACKGROUND_SYNC_LIMITS> = background ? BACKGROUND_SYNC_LIMITS : {};
+  const seconds = maxSeconds ?? defaults.maxSeconds;
+  return {
+    maxFiles: maxFiles ?? defaults.maxFiles,
+    maxBytes: maxBytes ?? defaults.maxBytes,
+    maxFileBytes: maxFileBytes ?? defaults.maxFileBytes,
+    deadlineMs: seconds === undefined ? undefined : Date.now() + seconds * 1000,
+  };
+}
+
+const BACKGROUND_SYNC_LIMITS = {
+  maxFiles: 50,
+  maxBytes: 256 * 1024 * 1024,
+  maxFileBytes: 128 * 1024 * 1024,
+  maxSeconds: 300,
+};
+
 const onlyHarnesses = parseOnlyHarness();
-const summaryLimit = parseSummaryLimit();
+// The detached child of a hook launch is marked so it keeps the background defaults.
+const backgroundRun = isBackground || process.env.EPISODIC_MEMORY_BACKGROUND_SYNC === '1';
+// A hook-launched run spends no summarizer quota unless a limit is given explicitly.
+const summaryLimit = parseSummaryLimit() ?? (backgroundRun ? 0 : undefined);
+const syncLimits = parseSyncLimits(backgroundRun);
 
 // If background mode, fork the process and exit immediately
 if (isBackground) {
@@ -149,7 +189,8 @@ if (isBackground) {
     ...filteredArgs
   ], {
     detached: true,
-    stdio: ['ignore', logFd, logFd]
+    stdio: ['ignore', logFd, logFd],
+    env: { ...process.env, EPISODIC_MEMORY_BACKGROUND_SYNC: '1' },
   });
 
   child.unref(); // Allow parent to exit
@@ -213,24 +254,39 @@ console.log(`Sources: ${sourceDirs.join(', ')}`);
 console.log(`Destination: ${destDir}\n`);
 
 async function syncAll() {
-  const totals = { copied: 0, skipped: 0, indexed: 0, summarized: 0, errors: [] as Array<{file: string; error: string}>, sourcesWithSummaryWork: 0, totalNeedingSummaries: 0 };
+  const totals = { copied: 0, skipped: 0, indexed: 0, summarized: 0, deferred: 0, deferredOversize: 0, refused: 0, errors: [] as Array<{file: string; error: string}>, sourcesWithSummaryWork: 0, totalNeedingSummaries: 0 };
+  const budget = createSyncBudget(syncLimits);
 
   for (const sourceDir of sourceDirs) {
-    const result = await syncConversations(sourceDir, destDir, { ...syncOptions, summaryLimit });
+    const result = await syncConversations(sourceDir, destDir, { ...syncOptions, summaryLimit, budget });
     totals.copied += result.copied;
     totals.skipped += result.skipped;
     totals.indexed += result.indexed;
     totals.summarized += result.summarized;
+    totals.deferred += result.deferred;
+    totals.deferredOversize += result.deferredOversize;
+    totals.refused += result.refused;
     totals.errors.push(...result.errors);
   }
 
-  if (totals.errors.length === 0) await runEmbeddingMigrationPhase();
-  else process.exitCode = 1;
+  // Re-embedding is further work, so a run past its deadline leaves it for the next sync.
+  const pastDeadline = syncLimits.deadlineMs !== undefined && Date.now() >= syncLimits.deadlineMs;
+  if (totals.errors.length === 0 && !pastDeadline) await runEmbeddingMigrationPhase();
+  else if (totals.errors.length > 0) process.exitCode = 1;
 
   console.log(totals.errors.length > 0 ? '\n⚠️  Sync finished with errors.' : '\n✅ Sync complete!');
   console.log(`  Copied: ${totals.copied}`);
   console.log(`  Skipped: ${totals.skipped}`);
   console.log(`  Indexed: ${totals.indexed}`);
+  if (totals.deferred > 0) {
+    console.log(`  Deferred: ${totals.deferred} (whole-operation budget reached; the next sync continues)`);
+  }
+  if (totals.deferredOversize > 0) {
+    console.log(`  Deferred oversize: ${totals.deferredOversize} (each exceeds --max-file-bytes; sync them with a larger limit)`);
+  }
+  if (totals.refused > 0) {
+    console.log(`  Refused: ${totals.refused} (screening refuses their current content; retried when they or the policy change)`);
+  }
   if (syncOptions.skipSummaries) {
     console.log('  Summaries: skipped (EPISODIC_MEMORY_SKIP_SUMMARIES=1)');
   } else {

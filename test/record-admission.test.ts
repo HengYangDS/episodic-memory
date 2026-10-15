@@ -239,14 +239,38 @@ describe('persistent record exclusion at native ingestion boundaries', () => {
     expect(fs.readFileSync(archiveFile)).toEqual(fs.readFileSync(sourceFile));
   });
 
-  it('rejects source mutation during streaming without publishing a derived file', async () => {
+  it('publishes the admitted snapshot when the source grows during streaming and admits the growth next time', async () => {
+    policy();
+    const original = fs.createReadStream;
+    const later = JSON.stringify(message('user', 'later public content')) + '\n';
+    let changed = false;
+    vi.spyOn(fs, 'createReadStream').mockImplementation(((file: any, options: any) => {
+      if (file === sourceFile && !changed) {
+        changed = true;
+        fs.appendFileSync(sourceFile, later);
+      }
+      return original(file, options);
+    }) as typeof fs.createReadStream);
+    expect(await archiveAdmittedConversation(sourceFile, archiveFile)).toBe(true);
+    const snapshot = fs.readFileSync(archiveFile, 'utf8');
+    expect(snapshot).not.toContain('later public content');
+    expect(snapshot).not.toContain(PRIVATE);
+    vi.restoreAllMocks();
+
+    expect(await archiveAdmittedConversation(sourceFile, archiveFile)).toBe(true);
+    expect(fs.readFileSync(archiveFile, 'utf8')).toBe(snapshot + later);
+  });
+
+  it('rejects a source rewrite during streaming without publishing a derived file', async () => {
     policy();
     const original = fs.createReadStream;
     let changed = false;
     vi.spyOn(fs, 'createReadStream').mockImplementation(((file: any, options: any) => {
       if (file === sourceFile && !changed) {
         changed = true;
-        fs.appendFileSync(sourceFile, JSON.stringify(message('user', 'later public content')) + '\n');
+        const fd = fs.openSync(sourceFile, 'r+');
+        try { fs.writeSync(fd, 'safe question ONE', fs.readFileSync(sourceFile, 'utf8').indexOf('safe question one')); }
+        finally { fs.closeSync(fd); }
       }
       return original(file, options);
     }) as typeof fs.createReadStream);

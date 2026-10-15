@@ -1,7 +1,8 @@
 import fs from 'fs';
-import { archiveAdmittedConversation, readRecordExclusions } from './record-admission.js';
+import crypto from 'crypto';
+import { archiveAdmittedConversation, archiveIsCurrent, conversationLines, isCompressedConversation, isScreeningRefusal, readRecordExclusions, recordExclusionsChangedMs, } from './record-admission.js';
 import path from 'path';
-import { getExcludedProjects, findJsonlFiles, statIfExists } from './paths.js';
+import { archivedRolloutRelativePath, getExcludedProjects, findJsonlFiles, statIfExists } from './paths.js';
 import { formatErrorSentinel, shouldQueueForSummary } from './summary-sentinel.js';
 import { getMaxMessageBytes, isOversizeExchange } from './message-size.js';
 export { shouldSkipConversation } from './record-admission.js';
@@ -14,11 +15,12 @@ import { shouldSkipConversation } from './record-admission.js';
  * every run — one new stub per summary generated. A transcript that has no
  * messages *yet* (a session that just started) is skipped this run and picked
  * up on a later sync once it has content, since its mtime keeps advancing.
+ * Reading stops at the first message line, so a large transcript is not
+ * loaded whole.
  */
-function hasConversationContent(filePath) {
+async function hasConversationContent(filePath) {
     try {
-        const content = fs.readFileSync(filePath, 'utf-8');
-        for (const line of content.split('\n')) {
+        for await (const line of conversationLines(filePath)) {
             if (!line.trim())
                 continue;
             try {
@@ -59,6 +61,12 @@ function hasConversationContent(filePath) {
         return true;
     }
 }
+export function createSyncBudget(limits = {}) {
+    return { limits, files: 0, bytes: 0 };
+}
+function pastDeadline(budget) {
+    return budget.limits.deadlineMs !== undefined && Date.now() >= budget.limits.deadlineMs;
+}
 /**
  * Derive sync options from the process environment.
  *
@@ -87,13 +95,68 @@ export function extractSessionIdFromPath(filePath) {
     }
     return null;
 }
+/**
+ * Bytes an admission would read: only the appended part of an archived
+ * transcript, and an allowance for decompressing a compressed rollout.
+ */
+function admissionCost(candidate) {
+    if (isCompressedConversation(candidate.source))
+        return candidate.size * 8;
+    const archived = statIfExists(candidate.destination);
+    return archived?.isFile() ? Math.max(0, candidate.size - archived.size) : candidate.size;
+}
+/** Identity, size and time of a regular file; any write or replacement changes it. */
+function fileState(file) {
+    try {
+        const info = fs.lstatSync(file);
+        return info.isFile() ? `${info.dev}:${info.ino}:${info.size}:${info.mtimeMs}` : undefined;
+    }
+    catch {
+        return undefined;
+    }
+}
+function createSyncState(db, policyDigest) {
+    const indexed = db.prepare('SELECT 1 FROM exchanges WHERE archive_path = ? LIMIT 1');
+    const find = db.prepare('SELECT state, policy FROM sync_refusals WHERE stage = ? AND path = ?');
+    const record = db.prepare('INSERT OR REPLACE INTO sync_refusals (stage, path, state, policy, reason, refused_at) VALUES (?, ?, ?, ?, ?, ?)');
+    const forget = db.prepare('DELETE FROM sync_refusals WHERE stage = ? AND path = ?');
+    return {
+        indexed: archive => indexed.get(archive) !== undefined,
+        refused(stage, file) {
+            const row = find.get(stage, file);
+            return row !== undefined && row.policy === policyDigest && row.state === fileState(file);
+        },
+        refuse(stage, file, readState, error) {
+            if (readState !== undefined && readState === fileState(file)) {
+                record.run(stage, file, readState, policyDigest, error.message, Date.now());
+            }
+        },
+        admitted(stage, file) {
+            forget.run(stage, file);
+        },
+    };
+}
+/** A refusal for a file that no longer exists has nothing left to protect. */
+function forgetVanishedRefusals(db) {
+    const forget = db.prepare('DELETE FROM sync_refusals WHERE stage = ? AND path = ?');
+    for (const row of db.prepare('SELECT stage, path FROM sync_refusals').all()) {
+        if (fileState(row.path) === undefined)
+            forget.run(row.stage, row.path);
+    }
+}
 export async function syncConversations(sourceDir, destDir, options = {}) {
     const exclusions = readRecordExclusions();
+    const exclusionsChangedMs = recordExclusionsChangedMs();
+    const budget = options.budget ?? createSyncBudget();
+    const { maxFiles, maxBytes, maxFileBytes } = budget.limits;
     const result = {
         copied: 0,
         skipped: 0,
         indexed: 0,
         summarized: 0,
+        deferred: 0,
+        deferredOversize: 0,
+        refused: 0,
         errors: []
     };
     // Ensure source directory exists
@@ -103,10 +166,13 @@ export async function syncConversations(sourceDir, destDir, options = {}) {
     // Collect files to index and summarize
     const filesToIndex = [];
     const filesToSummarize = [];
+    const summaryLimit = options.summaryLimit ?? 10;
+    let summariesOutstanding = 0;
     // Walk source directory
     const projects = fs.readdirSync(sourceDir);
     const excludedProjects = getExcludedProjects();
     const excludedDirSet = new Set(excludedProjects);
+    const candidates = [];
     for (const project of projects) {
         if (excludedProjects.includes(project)) {
             console.log("\nSkipping excluded project: " + project);
@@ -114,39 +180,113 @@ export async function syncConversations(sourceDir, destDir, options = {}) {
         }
         const projectPath = path.join(sourceDir, project);
         const stat = statIfExists(projectPath);
+        if (stat?.isFile()) {
+            // A finished Codex rollout moved out of its dated directory.
+            const relative = archivedRolloutRelativePath(project);
+            if (relative) {
+                candidates.push({ source: projectPath, destination: path.join(destDir, relative), size: stat.size, mtimeMs: stat.mtimeMs });
+            }
+            continue;
+        }
         if (!stat?.isDirectory())
             continue;
-        const files = findJsonlFiles(projectPath, excludedDirSet);
+        const files = findJsonlFiles(projectPath, excludedDirSet, { includeCompressed: true });
         for (const file of files) {
-            const srcFile = path.join(projectPath, file);
-            const destFile = path.join(destDir, project, file);
+            const source = path.join(projectPath, file);
+            const destination = path.join(destDir, project, file.replace(/\.zst$/, ''));
+            const info = statIfExists(source);
+            candidates.push({ source, destination, size: info?.size ?? 0, mtimeMs: info?.mtimeMs ?? 0 });
+        }
+    }
+    // Recent conversations are the most useful to recall, so a bounded run reaches them first.
+    candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+    // Refusals are remembered for this exact policy; any policy change retries them.
+    const policyDigest = crypto.createHash('sha256').update(JSON.stringify(exclusions)).digest('hex');
+    let state;
+    let closeState;
+    if (!options.skipIndex) {
+        const { initDatabase } = await import('./db.js');
+        const db = initDatabase();
+        closeState = () => db.close();
+        forgetVanishedRefusals(db);
+        state = createSyncState(db, policyDigest);
+    }
+    try {
+        for (const candidate of candidates) {
+            const { source: srcFile, destination: destFile } = candidate;
             try {
-                // Skip message-less transcripts (summarizer-spawned stubs, sessions
-                // that haven't produced content yet) before they enter the archive.
-                if (!hasConversationContent(srcFile)) {
+                if (archiveIsCurrent(srcFile, destFile, exclusions, exclusionsChangedMs)) {
                     result.skipped++;
+                    // An archive whose indexing never completed is indexed from its archive copy.
+                    if (state && !pastDeadline(budget) && !state.indexed(destFile))
+                        filesToIndex.push(destFile);
+                }
+                else if (state?.refused('admission', srcFile)) {
+                    result.refused++;
                     continue;
                 }
-                const wasCopied = await archiveAdmittedConversation(srcFile, destFile, exclusions);
-                if (wasCopied) {
-                    result.copied++;
-                    filesToIndex.push(destFile);
-                }
                 else {
-                    result.skipped++;
+                    const cost = admissionCost(candidate);
+                    if (maxFileBytes !== undefined && cost > maxFileBytes) {
+                        result.deferredOversize++;
+                        continue;
+                    }
+                    if (pastDeadline(budget) || (maxFiles !== undefined && budget.files >= maxFiles) ||
+                        (maxBytes !== undefined && budget.bytes + cost > maxBytes)) {
+                        result.deferred++;
+                        continue;
+                    }
+                    // Skip message-less transcripts (summarizer-spawned stubs, sessions
+                    // that haven't produced content yet) before they enter the archive.
+                    if (!(await hasConversationContent(srcFile))) {
+                        result.skipped++;
+                        continue;
+                    }
+                    budget.files++;
+                    budget.bytes += cost;
+                    const readState = fileState(srcFile);
+                    let wasCopied;
+                    try {
+                        wasCopied = await archiveAdmittedConversation(srcFile, destFile, exclusions);
+                    }
+                    catch (error) {
+                        if (!isScreeningRefusal(error))
+                            throw error;
+                        result.refused++;
+                        state?.refuse('admission', srcFile, readState, error);
+                        continue;
+                    }
+                    state?.admitted('admission', srcFile);
+                    if (wasCopied) {
+                        result.copied++;
+                        filesToIndex.push(destFile);
+                    }
+                    else {
+                        result.skipped++;
+                        // Re-admission can confirm an unchanged archive whose indexing never completed.
+                        if (state && !state.indexed(destFile) && archiveIsCurrent(srcFile, destFile, exclusions, exclusionsChangedMs)) {
+                            filesToIndex.push(destFile);
+                        }
+                    }
                 }
                 // Check if this file needs a summary (whether newly copied or existing).
                 // shouldQueueForSummary skips files that already have a real summary or
                 // an empty zero-exchange sentinel, and retries stale error sentinels (#96).
-                if (!options.skipSummaries) {
+                // Only the summaries this run can generate are screened for markers.
+                if (!options.skipSummaries && summaryLimit > 0 && fs.existsSync(destFile)) {
                     const summaryPath = destFile.replace('.jsonl', '-summary.txt');
-                    if (shouldQueueForSummary(summaryPath) && !shouldSkipConversation(destFile)) {
-                        // sessionId enables source-session summarization. When the filename
-                        // has no UUID (e.g. agent-<hex>.jsonl), queue anyway: Codex uses an
-                        // isolated transcript-only thread; other harnesses use their own
-                        // transcript-text route without resuming a source session.
-                        const sessionId = extractSessionIdFromPath(destFile) ?? undefined;
-                        filesToSummarize.push({ path: destFile, sessionId });
+                    if (shouldQueueForSummary(summaryPath)) {
+                        if (filesToSummarize.length >= summaryLimit) {
+                            summariesOutstanding++;
+                        }
+                        else if (!shouldSkipConversation(destFile)) {
+                            // sessionId enables source-session summarization. When the filename
+                            // has no UUID (e.g. agent-<hex>.jsonl), queue anyway: Codex uses an
+                            // isolated transcript-only thread; other harnesses use their own
+                            // transcript-text route without resuming a source session.
+                            const sessionId = extractSessionIdFromPath(destFile) ?? undefined;
+                            filesToSummarize.push({ path: destFile, sessionId });
+                        }
                     }
                 }
             }
@@ -157,6 +297,9 @@ export async function syncConversations(sourceDir, destDir, options = {}) {
                 });
             }
         }
+    }
+    finally {
+        closeState?.();
     }
     // Index copied files (unless skipIndex is set)
     if (!options.skipIndex && filesToIndex.length > 0) {
@@ -186,16 +329,27 @@ export async function syncConversations(sourceDir, destDir, options = {}) {
             const { getExchangesNeedingIndex, initDatabase, insertExchange } = await import('./db.js');
             const { generateExchangeEmbedding } = embeddings;
             const db = initDatabase();
+            const indexState = createSyncState(db, policyDigest);
             const maxMessageBytes = getMaxMessageBytes();
             let oversizeSkipped = 0;
             for (const file of filesToIndex) {
+                // An archive left unindexed at the deadline has no rows and is indexed next run.
+                if (pastDeadline(budget)) {
+                    result.deferred++;
+                    continue;
+                }
+                if (indexState.refused('index', file)) {
+                    result.refused++;
+                    continue;
+                }
+                const readState = fileState(file);
                 try {
                     // Check for DO NOT INDEX marker
                     if (shouldSkipConversation(file)) {
                         continue; // Skip indexing but file is already copied
                     }
                     const project = path.basename(path.dirname(file));
-                    const exchanges = await parseConversation(file, project, file);
+                    const exchanges = await parseConversation(file, project, file, { archiveRoot: destDir });
                     const newExchanges = getExchangesNeedingIndex(db, file, exchanges);
                     for (const exchange of newExchanges) {
                         // Skip oversize single messages BEFORE embedding — a foreign
@@ -210,8 +364,14 @@ export async function syncConversations(sourceDir, destDir, options = {}) {
                         insertExchange(db, exchange, embedding, toolNames);
                     }
                     result.indexed++;
+                    indexState.admitted('index', file);
                 }
                 catch (error) {
+                    if (isScreeningRefusal(error)) {
+                        result.refused++;
+                        indexState.refuse('index', file, readState, error);
+                        continue;
+                    }
                     result.errors.push({
                         file,
                         error: error instanceof Error ? error.message : String(error)
@@ -228,9 +388,8 @@ export async function syncConversations(sourceDir, destDir, options = {}) {
     if (!options.skipSummaries && filesToSummarize.length > 0) {
         const { parseConversation } = await import('./parser.js');
         const { summarizeConversation, isAuthFailure } = await import('./summarizer.js');
-        const summaryLimit = options.summaryLimit ?? 10;
-        const toSummarize = filesToSummarize.slice(0, summaryLimit);
-        const remaining = filesToSummarize.length - toSummarize.length;
+        const toSummarize = filesToSummarize;
+        const remaining = summariesOutstanding;
         console.log(`Generating summaries for ${toSummarize.length} conversation(s)...`);
         if (remaining > 0) {
             console.log(`  (${remaining} more need summaries - will process on next sync)`);

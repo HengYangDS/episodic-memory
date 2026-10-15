@@ -1,5 +1,7 @@
 import { ConversationExchange } from './types.js';
-export declare function parseConversation(filePath: string, projectName: string, archivePath: string): Promise<ConversationExchange[]>;
+export declare function parseConversation(filePath: string, projectName: string, archivePath: string, options?: {
+    archiveRoot?: string;
+}): Promise<ConversationExchange[]>;
 /**
  * Cursor transcripts carry no workspace field; recover the working directory
  * from tool-call inputs: explicit cwd/working_directory values when present,
