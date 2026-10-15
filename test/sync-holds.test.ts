@@ -277,6 +277,22 @@ describe('rewritten sources', () => {
     expect(holdRows('rebuild')).toBe(0);
   });
 
+  it('keeps a rewritten archive whose source is not newer than it, even when asked', async () => {
+    writePolicy(fixture);
+    const source = rollout(day, 1, codexLines(session(1), 2), ago(60));
+    const archive = path.join(archiveDay, path.basename(source));
+    await sync();
+    const previous = fs.readFileSync(archive, 'utf8');
+    // A format migration that kept an older modification time adds no content the archive lacks.
+    rewrite(source, 0);
+    fs.utimesSync(source, ago(120), ago(120));
+
+    const result = await syncConversations(fixture.sourceDir, fixture.destDir, { skipSummaries: true, replaceDiverged: true });
+    expect(result).toMatchObject({ copied: 0, diverged: 1 });
+    expect(fs.readFileSync(archive, 'utf8')).toBe(previous);
+    expect(holdRows('rebuild')).toBe(0);
+  });
+
   it('finishes a rebuild that an interruption left pending', async () => {
     writePolicy(fixture);
     const source = rollout(day, 1, codexLines(session(1), 2), ago(60));

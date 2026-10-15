@@ -139,9 +139,10 @@ export interface SyncOptions {
   summaryLimit?: number; // Max summaries to generate per run (default: 10)
   budget?: SyncBudget;
   /**
-   * Replace an indexed archive whose source was rewritten with the admitted
-   * rewrite and rebuild its rows from scratch. A rebuild interrupted after the
-   * archive was replaced is finished by the next indexing run.
+   * Replace an indexed archive whose source was rewritten after the archive was
+   * written with the admitted rewrite, and rebuild its rows from scratch. A
+   * rebuild interrupted after the archive was replaced is finished by the next
+   * indexing run.
    */
   replaceDiverged?: boolean;
 }
@@ -204,6 +205,17 @@ function fileState(file: string): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+/**
+ * True when a source was modified after its archive was written. A rewrite that
+ * kept its original modification time changed only the format of content the
+ * archive already holds, so replacing that archive gains nothing.
+ */
+function sourceNewerThanArchive(source: string, archive: string): boolean {
+  const sourceInfo = statIfExists(source);
+  const archiveInfo = statIfExists(archive);
+  return sourceInfo !== null && archiveInfo !== null && sourceInfo.mtimeMs > archiveInfo.mtimeMs;
 }
 
 /** The source bytes and archive an admission is about to compare. */
@@ -462,8 +474,10 @@ export async function syncConversations(
           if (state && !pastDeadline(budget) && !state.indexed(destFile)) filesToIndex.push(destFile);
         } else {
           const heldFor = state?.heldSource(srcFile, destFile);
-          // An explicit migration replaces a rewritten archive instead of keeping it.
-          const replacing = options.replaceDiverged === true && heldFor !== undefined && isArchiveDivergence(new Error(heldFor));
+          // An explicit migration replaces a rewritten archive instead of keeping it, but only when
+          // the source changed after the archive was written and so may hold content it lacks.
+          const replaceable = options.replaceDiverged === true && sourceNewerThanArchive(srcFile, destFile);
+          const replacing = replaceable && heldFor !== undefined && isArchiveDivergence(new Error(heldFor));
           if (heldFor !== undefined && !replacing) {
             countHeld(result, heldFor);
             continue;
@@ -502,7 +516,7 @@ export async function syncConversations(
             try {
               wasCopied = await admit(keepCoordinates);
             } catch (error) {
-              if (!(options.replaceDiverged && state && isArchiveDivergence(error))) throw error;
+              if (!(replaceable && state && isArchiveDivergence(error))) throw error;
               // Marked before the archive changes, so an interrupted replacement still rebuilds its rows.
               state.markRebuild(destFile);
               rebuilding = true;

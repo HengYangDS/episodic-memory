@@ -57,7 +57,7 @@ OPTIONS:
   --max-bytes N       Max transcript bytes to admit this run (background default: 256 MiB)
   --max-file-bytes N  Defer a transcript whose admission exceeds N bytes (background default: 128 MiB)
   --max-seconds N     Start no new work after N seconds; admission stops after two thirds of them (background default: 300)
-  --replace-diverged  Replace each indexed archive whose source was rewritten and rebuild its rows
+  --replace-diverged  Replace each indexed archive whose source was rewritten after it was written, and rebuild its rows
 
 EXAMPLES:
   # Sync all new conversations

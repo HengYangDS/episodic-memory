@@ -54,9 +54,10 @@ export interface SyncOptions {
     summaryLimit?: number;
     budget?: SyncBudget;
     /**
-     * Replace an indexed archive whose source was rewritten with the admitted
-     * rewrite and rebuild its rows from scratch. A rebuild interrupted after the
-     * archive was replaced is finished by the next indexing run.
+     * Replace an indexed archive whose source was rewritten after the archive was
+     * written with the admitted rewrite, and rebuild its rows from scratch. A
+     * rebuild interrupted after the archive was replaced is finished by the next
+     * indexing run.
      */
     replaceDiverged?: boolean;
 }
