@@ -14,7 +14,9 @@ export declare function migrateSchema(db: Database.Database): void;
  */
 export declare function migrateToolCallsCascade(db: Database.Database): void;
 export declare function initDatabase(): Database.Database;
-export declare function insertExchange(db: Database.Database, exchange: ConversationExchange, embedding: number[], toolNames?: string[]): void;
+export declare function insertExchange(db: Database.Database, exchange: ConversationExchange, embedding: number[], toolNames?: string[], options?: {
+    admitted?: boolean;
+}): void;
 /** Select new or extended exchanges without re-embedding stable indexed spans. */
 export declare function getExchangesNeedingIndex(db: Database.Database, archivePath: string, exchanges: ConversationExchange[]): ConversationExchange[];
 export declare function getAllExchanges(db: Database.Database): Array<{

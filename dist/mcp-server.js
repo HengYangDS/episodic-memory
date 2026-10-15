@@ -31125,20 +31125,24 @@ async function readAdmittedConversation(file2, startLine = 1, endLine = Infinity
   for await (const record2 of admittedRecords(file2, readRecordExclusions(), startLine, endLine)) lines.push(record2.line);
   return lines.join("\n");
 }
-function admitExchange(exchange, policy = readRecordExclusions()) {
-  if (!policy) return exchange;
+function filterExchange(exchange, policy) {
   const sessionIds = [exchange.sessionId, sessionFromPath(exchange.archivePath)].filter((id) => !!id);
   const transcript = path2.basename(exchange.archivePath);
   if (policy.exchanges.some((x2) => sessionIds.includes(x2.session_id) && x2.transcript === transcript && exchange.lineStart <= x2.line_end && exchange.lineEnd >= x2.line_start)) return null;
   const kept = exchange.toolCalls?.filter((call) => !sessionIds.some((id) => blockedCall(policy, id, transcript, call.id)));
-  const admitted = kept && kept.length !== exchange.toolCalls?.length ? { ...exchange, toolCalls: kept } : exchange;
+  return kept && kept.length !== exchange.toolCalls?.length ? { ...exchange, toolCalls: kept } : exchange;
+}
+function exchangeFields(exchange) {
+  const { userMessage, assistantMessage, toolCalls, ...metadata } = exchange;
+  return [userMessage, assistantMessage, ...toolCalls ?? [], metadata];
+}
+function admitExchange(exchange, policy = readRecordExclusions()) {
+  if (!policy) return exchange;
+  const admitted = filterExchange(exchange, policy);
+  if (!admitted) return null;
   const screener = createRecordScreener(policy);
   try {
-    screener.scan(admitted.userMessage);
-    screener.scan(admitted.assistantMessage);
-    for (const call of admitted.toolCalls ?? []) screener.scan(call);
-    const { userMessage, assistantMessage, toolCalls, ...metadata } = admitted;
-    screener.scan(metadata);
+    for (const field of exchangeFields(admitted)) screener.scan(field);
     return admitted;
   } finally {
     screener.close();

@@ -66,8 +66,8 @@ export function writePolicy(fixture: SyncFixture, rows: { exchanges?: unknown[];
   }), { mode: 0o600 });
 }
 
-// Records screened in transcript batches, which admission and archive parsing use;
-// indexing also screens each stored exchange on its own, which is not counted here.
+// Records screened in native batches, which admission, archive parsing and the
+// indexing of stored exchange fields use; a direct single-record scan is not counted.
 export function screenedRecords(fixture: SyncFixture): number {
   if (!fs.existsSync(fixture.scanLog)) return 0;
   return fs.readFileSync(fixture.scanLog, 'utf8').split('\n').filter(line => line.startsWith('batch '))

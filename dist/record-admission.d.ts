@@ -48,6 +48,12 @@ export declare function readAdmittedConversation(file: string, startLine?: numbe
 /** Enforce the same rule for direct callers that bypass transcript parsing. */
 export declare function admitExchange(exchange: ConversationExchange, policy?: RecordExclusions | null): ConversationExchange | null;
 /**
+ * Admit the exchanges of one conversation with one scanner: the policy filter
+ * of admitExchange, then every field screened as a separate record in native
+ * batches. A rejected field refuses them all, so no neighbor of it is stored.
+ */
+export declare function admitExchanges(exchanges: ConversationExchange[], policy?: RecordExclusions | null): Promise<ConversationExchange[]>;
+/**
  * When the record policy file last changed; 0 when there is none. The change
  * time also covers a replacement that kept an older modification time.
  */

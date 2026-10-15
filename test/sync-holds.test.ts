@@ -73,7 +73,7 @@ describe('archives written before the current policy', () => {
     fs.appendFileSync(source, codexLines(session(1), 1, 4));
     bump(source);
 
-    const result = await sync();
+    const result = await syncConversations(fixture.sourceDir, fixture.destDir, { skipSummaries: true, skipIndex: true });
     expect(result.copied).toBe(1);
     // One session record and four turns: nine records, not only the two appended ones.
     expect(screenedRecords(fixture)).toBe(9);
@@ -89,11 +89,13 @@ describe('archives written before the current policy', () => {
     const first = await sync();
     expect(first.copied).toBe(0);
     expect(first.indexed).toBe(1);
-    expect(screenedRecords(fixture)).toBe(5);
+    // Admission screens the five records; indexing screens each stored exchange's
+    // two messages and metadata, six fields, in one batch.
+    expect(screenedRecords(fixture)).toBe(5 + 6);
 
     const second = await sync();
     expect(second.indexed).toBe(0);
-    expect(screenedRecords(fixture)).toBe(5);
+    expect(screenedRecords(fixture)).toBe(5 + 6);
   });
 });
 
@@ -139,6 +141,22 @@ describe('refusal memory', () => {
     expect(result).toMatchObject({ copied: 1, refused: 0, errors: [] });
     expect(fs.readFileSync(path.join(archiveDay, path.basename(source)), 'utf8')).not.toContain(FLAGGED);
     expect(holdRows()).toBe(0);
+  });
+
+  it('stores no field of an archive when indexing screening rejects one, in batch scans only', async () => {
+    writePolicy(fixture);
+    const source = rollout(day, 1, codexLines(session(1), 2, 1, FLAGGED), ago(60));
+    const archive = path.join(archiveDay, path.basename(source));
+    // A copy stamped after the policy reads as screened, so only indexing screens its exchanges.
+    stampedCopy(source, archive);
+
+    const first = await sync();
+    expect(first).toMatchObject({ indexed: 0, refused: 1 });
+    expect(first.errors.map(entry => entry.error)).toEqual(['Record content rejected by screening']);
+    const db = new Database(process.env.EPISODIC_MEMORY_DB_PATH!, { readonly: true });
+    try { expect((db.prepare('SELECT COUNT(*) AS n FROM exchanges WHERE archive_path = ?').get(archive) as { n: number }).n).toBe(0); }
+    finally { db.close(); }
+    expect(fs.readFileSync(fixture.scanLog, 'utf8').trim().split('\n').every(line => line.startsWith('batch '))).toBe(true);
   });
 
   it('remembers an archive whose indexing screening refuses', async () => {

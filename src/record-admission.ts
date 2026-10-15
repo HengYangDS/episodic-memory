@@ -1000,24 +1000,49 @@ export async function readAdmittedConversation(file: string, startLine = 1, endL
   return lines.join('\n');
 }
 
-/** Enforce the same rule for direct callers that bypass transcript parsing. */
-export function admitExchange(exchange: ConversationExchange, policy = readRecordExclusions()): ConversationExchange | null {
-  if (!policy) return exchange;
+/** The record policy's exclusions for one exchange: null when it is excluded, else without its blocked tool calls. */
+function filterExchange(exchange: ConversationExchange, policy: RecordExclusions): ConversationExchange | null {
   // Historical Codex rows may carry a fork ancestor's ID. Neither that metadata
   // nor the filename may override a denial bound to the other known identity.
   const sessionIds = [exchange.sessionId, sessionFromPath(exchange.archivePath)].filter((id): id is string => !!id);
   const transcript = path.basename(exchange.archivePath);
   if (policy.exchanges.some(x => sessionIds.includes(x.session_id) && x.transcript === transcript && exchange.lineStart <= x.line_end && exchange.lineEnd >= x.line_start)) return null;
   const kept = exchange.toolCalls?.filter(call => !sessionIds.some(id => blockedCall(policy, id, transcript, call.id)));
-  const admitted = kept && kept.length !== exchange.toolCalls?.length ? { ...exchange, toolCalls: kept } : exchange;
+  return kept && kept.length !== exchange.toolCalls?.length ? { ...exchange, toolCalls: kept } : exchange;
+}
+
+/** The separately screened records of an exchange: each message, each tool call and its metadata. */
+function exchangeFields(exchange: ConversationExchange): unknown[] {
+  const { userMessage, assistantMessage, toolCalls, ...metadata } = exchange;
+  return [userMessage, assistantMessage, ...(toolCalls ?? []), metadata];
+}
+
+/** Enforce the same rule for direct callers that bypass transcript parsing. */
+export function admitExchange(exchange: ConversationExchange, policy = readRecordExclusions()): ConversationExchange | null {
+  if (!policy) return exchange;
+  const admitted = filterExchange(exchange, policy);
+  if (!admitted) return null;
   const screener = createRecordScreener(policy);
   try {
     // These are separate original records, not one keyword-prefilter fragment.
-    screener.scan(admitted.userMessage);
-    screener.scan(admitted.assistantMessage);
-    for (const call of admitted.toolCalls ?? []) screener.scan(call);
-    const { userMessage, assistantMessage, toolCalls, ...metadata } = admitted;
-    screener.scan(metadata);
+    for (const field of exchangeFields(admitted)) screener.scan(field);
+    return admitted;
+  } finally { screener.close(); }
+}
+
+/**
+ * Admit the exchanges of one conversation with one scanner: the policy filter
+ * of admitExchange, then every field screened as a separate record in native
+ * batches. A rejected field refuses them all, so no neighbor of it is stored.
+ */
+export async function admitExchanges(exchanges: ConversationExchange[], policy = readRecordExclusions()): Promise<ConversationExchange[]> {
+  if (!policy) return exchanges;
+  const admitted = exchanges.map(exchange => filterExchange(exchange, policy))
+    .filter((exchange): exchange is ConversationExchange => exchange !== null);
+  if (admitted.length === 0) return admitted;
+  const screener = createRecordScreener(policy);
+  try {
+    await screener.scanMany(admitted.flatMap(exchangeFields));
     return admitted;
   } finally { screener.close(); }
 }

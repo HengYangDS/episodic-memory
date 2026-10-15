@@ -1,6 +1,6 @@
 import fs from 'fs';
 import crypto from 'crypto';
-import { archiveAdmittedConversation, archiveIsCurrent, conversationLines, isCompressedConversation, isArchiveDivergence, isAdmissionRefusal, readRecordExclusions, recordExclusionsChangedMs, } from './record-admission.js';
+import { admitExchanges, archiveAdmittedConversation, archiveIsCurrent, conversationLines, isCompressedConversation, isArchiveDivergence, isAdmissionRefusal, readRecordExclusions, recordExclusionsChangedMs, } from './record-admission.js';
 import path from 'path';
 import { archivedRolloutRelativePath, getExcludedProjects, findJsonlFiles, statIfExists } from './paths.js';
 import { formatErrorSentinel, shouldQueueForSummary } from './summary-sentinel.js';
@@ -508,15 +508,23 @@ export async function syncConversations(sourceDir, destDir, options = {}) {
                     }
                     const project = path.basename(path.dirname(file));
                     const exchanges = await parseConversation(file, project, file, { archiveRoot: destDir });
-                    if (pendingRebuild.has(file)) {
+                    const rebuilding = pendingRebuild.has(file);
+                    // Skip oversize single messages BEFORE embedding — a foreign
+                    // summarizer's pasted transcript is noise, and embedding it is the
+                    // expensive waste (#139).
+                    const candidates = (rebuilding ? exchanges : getExchangesNeedingIndex(db, file, exchanges)).filter(exchange => {
+                        if (!isOversizeExchange(exchange, maxMessageBytes))
+                            return true;
+                        oversizeSkipped++;
+                        return false;
+                    });
+                    // One scanner screens every stored field of this conversation in native batches.
+                    const admitted = await admitExchanges(candidates, exclusions);
+                    if (rebuilding) {
                         // The replaced archive's rows address lines it no longer has: embed every
                         // exchange first, then swap all of its rows in one transaction.
                         const prepared = [];
-                        for (const exchange of exchanges) {
-                            if (isOversizeExchange(exchange, maxMessageBytes)) {
-                                oversizeSkipped++;
-                                continue;
-                            }
+                        for (const exchange of admitted) {
                             const toolNames = exchange.toolCalls?.map(tc => tc.toolName);
                             prepared.push({ exchange, toolNames, embedding: await generateExchangeEmbedding(exchange.userMessage, exchange.assistantMessage, toolNames) });
                         }
@@ -524,23 +532,15 @@ export async function syncConversations(sourceDir, destDir, options = {}) {
                             for (const { id } of archiveRows.all(file))
                                 deleteExchange(db, id);
                             for (const entry of prepared)
-                                insertExchange(db, entry.exchange, entry.embedding, entry.toolNames);
+                                insertExchange(db, entry.exchange, entry.embedding, entry.toolNames, { admitted: true });
                         })();
                         indexState.release('rebuild', file);
                     }
                     else {
-                        const newExchanges = getExchangesNeedingIndex(db, file, exchanges);
-                        for (const exchange of newExchanges) {
-                            // Skip oversize single messages BEFORE embedding — a foreign
-                            // summarizer's pasted transcript is noise, and embedding it is the
-                            // expensive waste (#139).
-                            if (isOversizeExchange(exchange, maxMessageBytes)) {
-                                oversizeSkipped++;
-                                continue;
-                            }
+                        for (const exchange of admitted) {
                             const toolNames = exchange.toolCalls?.map(tc => tc.toolName);
                             const embedding = await generateExchangeEmbedding(exchange.userMessage, exchange.assistantMessage, toolNames);
-                            insertExchange(db, exchange, embedding, toolNames);
+                            insertExchange(db, exchange, embedding, toolNames, { admitted: true });
                         }
                     }
                     result.indexed++;

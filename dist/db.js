@@ -203,8 +203,9 @@ export function initDatabase() {
   `);
     return db;
 }
-export function insertExchange(db, exchange, embedding, toolNames) {
-    const admitted = admitExchange(exchange);
+export function insertExchange(db, exchange, embedding, toolNames, options = {}) {
+    // A caller that already admitted the exchange with admitExchanges passes it as admitted.
+    const admitted = options.admitted ? exchange : admitExchange(exchange);
     if (!admitted)
         return;
     exchange = admitted;

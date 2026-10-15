@@ -221,12 +221,13 @@ describe('append-only growth', () => {
   it('screens only the appended records and matches a full admission', async () => {
     writePolicy(fixture);
     const source = rollout(path.join(sourceDir, '2026', '10', '15'), 1, codexLines(session(1), 3), ago(60));
-    await syncConversations(sourceDir, destDir, { skipSummaries: true });
+    // Without indexing, every screened record is an admission record.
+    await syncConversations(sourceDir, destDir, { skipSummaries: true, skipIndex: true });
     const before = screenedRecords(fixture);
 
     fs.appendFileSync(source, codexLines(session(1), 1, 4));
     bump(source);
-    const second = await syncConversations(sourceDir, destDir, { skipSummaries: true });
+    const second = await syncConversations(sourceDir, destDir, { skipSummaries: true, skipIndex: true });
     expect(second.copied).toBe(1);
     expect(screenedRecords(fixture) - before).toBe(2);
     const archive = path.join(destDir, '2026', '10', '15', path.basename(source));

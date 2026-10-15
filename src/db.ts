@@ -233,9 +233,11 @@ export function insertExchange(
   db: Database.Database,
   exchange: ConversationExchange,
   embedding: number[],
-  toolNames?: string[]
+  toolNames?: string[],
+  options: { admitted?: boolean } = {}
 ): void {
-  const admitted = admitExchange(exchange);
+  // A caller that already admitted the exchange with admitExchanges passes it as admitted.
+  const admitted = options.admitted ? exchange : admitExchange(exchange);
   if (!admitted) return;
   exchange = admitted;
   const now = Date.now();
