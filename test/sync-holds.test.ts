@@ -102,7 +102,8 @@ describe('refusal memory', () => {
     const source = rollout(day, 1, codexLines(session(1), 2, 1, FLAGGED), ago(60));
 
     const first = await sync();
-    expect(first).toMatchObject({ copied: 0, refused: 1, errors: [] });
+    expect(first).toMatchObject({ copied: 0, refused: 1 });
+    expect(first.errors.map(entry => entry.error)).toEqual(['Record content rejected by screening']);
     expect(fs.existsSync(path.join(archiveDay, path.basename(source)))).toBe(false);
     const screened = screenedRecords(fixture);
     expect(screened).toBeGreaterThan(0);
@@ -115,6 +116,7 @@ describe('refusal memory', () => {
     bump(source);
     const third = await sync();
     expect(third.refused).toBe(1);
+    expect(third.errors).toHaveLength(1);
     expect(screenedRecords(fixture)).toBeGreaterThan(screened);
   });
 
@@ -139,7 +141,8 @@ describe('refusal memory', () => {
     writePolicy(fixture);
 
     const first = await sync();
-    expect(first).toMatchObject({ copied: 0, indexed: 0, refused: 1, errors: [] });
+    expect(first).toMatchObject({ copied: 0, indexed: 0, refused: 1 });
+    expect(first.errors).toHaveLength(1);
     expect(holdRows('index')).toBe(1);
     const screened = screenedRecords(fixture);
 
@@ -195,12 +198,13 @@ describe('rewritten sources', () => {
 
     rewrite(source, 1);
     const first = await sync();
-    expect(first).toMatchObject({ copied: 0, diverged: 1, errors: [] });
+    expect(first).toMatchObject({ copied: 0, diverged: 1 });
+    expect(first.errors.map(entry => entry.error)).toEqual(['Conversation source no longer holds its archived lines']);
     expect(fs.readFileSync(archive, 'utf8')).toBe(previous);
     expect(screenedRecords(fixture)).toBe(screened);
     expect(holdRows()).toBe(1);
 
-    expect((await sync()).diverged).toBe(1);
+    expect(await sync()).toMatchObject({ diverged: 1, errors: [] });
   });
 
   it('replaces a rewritten archive that no index rows reference', async () => {

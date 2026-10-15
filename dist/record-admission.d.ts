@@ -54,6 +54,12 @@ export declare function admitExchange(exchange: ConversationExchange, policy?: R
 export declare function recordExclusionsChangedMs(): number;
 /** True when admission refused the content itself, so retrying unchanged bytes cannot succeed. */
 export declare function isScreeningRefusal(error: unknown): boolean;
+/**
+ * True when admission refused a conversation's current bytes under the current
+ * policy: screening refused its content, or its identities disagree about an
+ * exclusion. Either way only a change to the file or the policy can admit it.
+ */
+export declare function isAdmissionRefusal(error: unknown): boolean;
 /** True when an existing archive already holds the admitted form of the source's current bytes. */
 export declare function archiveIsCurrent(source: string, destination: string, policy?: RecordExclusions | null, policyChangedMs?: number): boolean;
 /**

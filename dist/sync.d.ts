@@ -8,9 +8,13 @@ export interface SyncResult {
     deferred: number;
     /** Changed transcripts whose single admission would exceed the per-file byte limit. */
     deferredOversize: number;
-    /** Transcripts whose current bytes screening refuses; retried once they or the policy change. */
+    /**
+     * Transcripts whose current bytes the record policy refuses. The run that
+     * first sees a refusal also reports it as an error; later runs hold the
+     * unchanged file until it or the policy changes.
+     */
     refused: number;
-    /** Rewritten transcripts whose indexed archive is kept, because index rows address its lines. */
+    /** Rewritten transcripts whose indexed archive is kept, because index rows address its lines; reported like refusals. */
     diverged: number;
     errors: Array<{
         file: string;

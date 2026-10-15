@@ -289,7 +289,7 @@ async function syncAll() {
     console.log(`  Deferred oversize: ${totals.deferredOversize} (each exceeds --max-file-bytes; sync them with a larger limit)`);
   }
   if (totals.refused > 0) {
-    console.log(`  Refused: ${totals.refused} (screening refuses their current content; retried when they or the policy change)`);
+    console.log(`  Refused: ${totals.refused} (the record policy refuses their current content; retried when they or the policy change)`);
   }
   if (totals.diverged > 0) {
     console.log(`  Diverged: ${totals.diverged} (source rewritten under an indexed archive; archive and index rows kept)`);

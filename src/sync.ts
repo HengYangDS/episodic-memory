@@ -7,7 +7,7 @@ import {
   conversationLines,
   isCompressedConversation,
   isArchiveDivergence,
-  isScreeningRefusal,
+  isAdmissionRefusal,
   readRecordExclusions,
   recordExclusionsChangedMs,
 } from './record-admission.js';
@@ -80,9 +80,13 @@ export interface SyncResult {
   deferred: number;
   /** Changed transcripts whose single admission would exceed the per-file byte limit. */
   deferredOversize: number;
-  /** Transcripts whose current bytes screening refuses; retried once they or the policy change. */
+  /**
+   * Transcripts whose current bytes the record policy refuses. The run that
+   * first sees a refusal also reports it as an error; later runs hold the
+   * unchanged file until it or the policy changes.
+   */
   refused: number;
-  /** Rewritten transcripts whose indexed archive is kept, because index rows address its lines. */
+  /** Rewritten transcripts whose indexed archive is kept, because index rows address its lines; reported like refusals. */
   diverged: number;
   errors: Array<{ file: string; error: string }>;
 }
@@ -245,7 +249,7 @@ function releaseVanishedHolds(db: Database.Database): void {
 
 /** Count a stage that stopped on a file's content rather than failing. */
 function countHold(result: SyncResult, error: unknown): boolean {
-  if (isScreeningRefusal(error)) result.refused++;
+  if (isAdmissionRefusal(error)) result.refused++;
   else if (isArchiveDivergence(error)) result.diverged++;
   else return false;
   return true;
@@ -254,7 +258,7 @@ function countHold(result: SyncResult, error: unknown): boolean {
 function countHeld(result: SyncResult, reason: string): void {
   const held = new Error(reason);
   if (isArchiveDivergence(held)) result.diverged++;
-  else if (isScreeningRefusal(held)) result.refused++;
+  else if (isAdmissionRefusal(held)) result.refused++;
 }
 
 /** An archive whose exchanges are all empty, oversize or opted out gets no rows, so a row lookup cannot tell it was indexed. */
@@ -384,6 +388,8 @@ export async function syncConversations(
             wasCopied = await archiveAdmittedConversation(srcFile, destFile, exclusions, { keepCoordinates });
           } catch (error) {
             if (!countHold(result, error)) throw error;
+            // A stop on new content fails this run once; the unchanged file is then held, not retried.
+            result.errors.push({ file: srcFile, error: (error as Error).message });
             state?.hold('admission', srcFile, readState, admissionState(srcFile, destFile), error as Error);
             continue;
           }
@@ -512,10 +518,8 @@ export async function syncConversations(
           if (indexState.indexed(file)) indexState.release('index', file);
           else indexState.hold('index', file, readState, fileState(file), new Error(NOTHING_TO_INDEX));
         } catch (error) {
-          if (countHold(result, error)) {
-            indexState.hold('index', file, readState, fileState(file), error as Error);
-            continue;
-          }
+          // Held or not, a stop on new content fails this run once, like any indexing error.
+          if (countHold(result, error)) indexState.hold('index', file, readState, fileState(file), error as Error);
           result.errors.push({
             file,
             error: error instanceof Error ? error.message : String(error)

@@ -177,8 +177,12 @@ describe('persistent record exclusion at native ingestion boundaries', () => {
   it('rejects policy identity mismatch rather than silently selecting a different session', async () => {
     policy();
     fs.writeFileSync(sourceFile, transcript().replace(`"id":"${SESSION}"`, '"id":"00000000-aaaa-4bbb-8ccc-dddddddddddd"'));
-    const result = await syncConversations(source, archive, { skipIndex: true, skipSummaries: true });
-    expect(result.errors).toHaveLength(1);
+    // The first run fails on the refusal; the unchanged file is then held instead of read again.
+    const result = await syncConversations(source, archive, { skipSummaries: true });
+    expect(result.refused).toBe(1);
+    expect(result.errors.map(entry => entry.error)).toEqual(['Record exclusion session identity mismatch']);
+    expect(fs.existsSync(archiveFile)).toBe(false);
+    expect(await syncConversations(source, archive, { skipSummaries: true })).toMatchObject({ refused: 1, errors: [] });
     expect(fs.existsSync(archiveFile)).toBe(false);
   });
 

@@ -1095,6 +1095,14 @@ const SCREENING_REFUSALS = new Set([
 export function isScreeningRefusal(error) {
     return error instanceof Error && SCREENING_REFUSALS.has(error.message);
 }
+/**
+ * True when admission refused a conversation's current bytes under the current
+ * policy: screening refused its content, or its identities disagree about an
+ * exclusion. Either way only a change to the file or the policy can admit it.
+ */
+export function isAdmissionRefusal(error) {
+    return isScreeningRefusal(error) || (error instanceof Error && error.message === 'Record exclusion session identity mismatch');
+}
 /** Exclusions bind a session and transcript; either identity of a source counts as named. */
 function policyNamesConversation(policy, source) {
     const transcript = conversationTranscriptName(source);

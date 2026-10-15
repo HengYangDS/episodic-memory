@@ -1,6 +1,6 @@
 import fs from 'fs';
 import crypto from 'crypto';
-import { archiveAdmittedConversation, archiveIsCurrent, conversationLines, isCompressedConversation, isArchiveDivergence, isScreeningRefusal, readRecordExclusions, recordExclusionsChangedMs, } from './record-admission.js';
+import { archiveAdmittedConversation, archiveIsCurrent, conversationLines, isCompressedConversation, isArchiveDivergence, isAdmissionRefusal, readRecordExclusions, recordExclusionsChangedMs, } from './record-admission.js';
 import path from 'path';
 import { archivedRolloutRelativePath, getExcludedProjects, findJsonlFiles, statIfExists } from './paths.js';
 import { formatErrorSentinel, shouldQueueForSummary } from './summary-sentinel.js';
@@ -156,7 +156,7 @@ function releaseVanishedHolds(db) {
 }
 /** Count a stage that stopped on a file's content rather than failing. */
 function countHold(result, error) {
-    if (isScreeningRefusal(error))
+    if (isAdmissionRefusal(error))
         result.refused++;
     else if (isArchiveDivergence(error))
         result.diverged++;
@@ -168,7 +168,7 @@ function countHeld(result, reason) {
     const held = new Error(reason);
     if (isArchiveDivergence(held))
         result.diverged++;
-    else if (isScreeningRefusal(held))
+    else if (isAdmissionRefusal(held))
         result.refused++;
 }
 /** An archive whose exchanges are all empty, oversize or opted out gets no rows, so a row lookup cannot tell it was indexed. */
@@ -285,6 +285,8 @@ export async function syncConversations(sourceDir, destDir, options = {}) {
                     catch (error) {
                         if (!countHold(result, error))
                             throw error;
+                        // A stop on new content fails this run once; the unchanged file is then held, not retried.
+                        result.errors.push({ file: srcFile, error: error.message });
                         state?.hold('admission', srcFile, readState, admissionState(srcFile, destFile), error);
                         continue;
                     }
@@ -405,10 +407,9 @@ export async function syncConversations(sourceDir, destDir, options = {}) {
                         indexState.hold('index', file, readState, fileState(file), new Error(NOTHING_TO_INDEX));
                 }
                 catch (error) {
-                    if (countHold(result, error)) {
+                    // Held or not, a stop on new content fails this run once, like any indexing error.
+                    if (countHold(result, error))
                         indexState.hold('index', file, readState, fileState(file), error);
-                        continue;
-                    }
                     result.errors.push({
                         file,
                         error: error instanceof Error ? error.message : String(error)
