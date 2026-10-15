@@ -53,6 +53,12 @@ export interface SyncOptions {
     skipSummaries?: boolean;
     summaryLimit?: number;
     budget?: SyncBudget;
+    /**
+     * Replace an indexed archive whose source was rewritten with the admitted
+     * rewrite and rebuild its rows from scratch. A rebuild interrupted after the
+     * archive was replaced is finished by the next indexing run.
+     */
+    replaceDiverged?: boolean;
 }
 /**
  * Derive sync options from the process environment.

@@ -20,6 +20,7 @@ vi.mock('../src/embeddings.js', () => ({
 
 import { syncConversations } from '../src/sync.js';
 import { archiveAdmittedConversation } from '../src/record-admission.js';
+import { parseConversation } from '../src/parser.js';
 
 let prior: NodeJS.ProcessEnv;
 let fixture: SyncFixture;
@@ -228,5 +229,54 @@ describe('rewritten sources', () => {
     const result = await sync();
     expect(result).toMatchObject({ copied: 1, indexed: 1, diverged: 0, errors: [] });
     expect(fs.readFileSync(path.join(archiveDay, path.basename(source)), 'utf8')).toBe(await fullAdmission(source));
+  });
+
+  /** Line ranges of an archive's rows, and of the exchanges its current bytes hold. */
+  async function ranges(archive: string): Promise<{ rows: number[][]; parsed: number[][] }> {
+    const db = new Database(process.env.EPISODIC_MEMORY_DB_PATH!, { readonly: true });
+    try {
+      const rows = (db.prepare('SELECT line_start, line_end FROM exchanges WHERE archive_path = ? ORDER BY line_start')
+        .all(archive) as Array<{ line_start: number; line_end: number }>).map(row => [row.line_start, row.line_end]);
+      const parsed = (await parseConversation(archive, 'fixture', archive)).map(exchange => [exchange.lineStart, exchange.lineEnd]);
+      return { rows, parsed };
+    } finally { db.close(); }
+  }
+
+  it('replaces a rewritten indexed archive and rebuilds its rows when asked', async () => {
+    writePolicy(fixture);
+    const source = rollout(day, 1, codexLines(session(1), 2), ago(60));
+    const archive = path.join(archiveDay, path.basename(source));
+    await sync();
+    rewrite(source, 1);
+    expect((await sync()).diverged).toBe(1);
+
+    const result = await syncConversations(fixture.sourceDir, fixture.destDir, { skipSummaries: true, replaceDiverged: true });
+    expect(result).toMatchObject({ copied: 1, diverged: 0, errors: [] });
+    expect(fs.readFileSync(archive, 'utf8')).toBe(await fullAdmission(source));
+    const { rows, parsed } = await ranges(archive);
+    expect(rows).toEqual(parsed);
+    expect(holdRows()).toBe(0);
+    expect(holdRows('rebuild')).toBe(0);
+  });
+
+  it('finishes a rebuild that an interruption left pending', async () => {
+    writePolicy(fixture);
+    const source = rollout(day, 1, codexLines(session(1), 2), ago(60));
+    const archive = path.join(archiveDay, path.basename(source));
+    await sync();
+    rewrite(source, 1);
+    await sync();
+
+    embedSpy.mockRejectedValueOnce(new Error('embedding backend stopped'));
+    const interrupted = await syncConversations(fixture.sourceDir, fixture.destDir, { skipSummaries: true, replaceDiverged: true });
+    expect(interrupted.copied).toBe(1);
+    expect(interrupted.errors.map(entry => entry.error)).toEqual(['embedding backend stopped']);
+    expect(holdRows('rebuild')).toBe(1);
+
+    // A plain later run finishes the rebuild of the already replaced archive.
+    expect((await sync()).errors).toEqual([]);
+    const { rows, parsed } = await ranges(archive);
+    expect(rows).toEqual(parsed);
+    expect(holdRows('rebuild')).toBe(0);
   });
 });

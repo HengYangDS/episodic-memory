@@ -137,6 +137,12 @@ export interface SyncOptions {
   skipSummaries?: boolean;
   summaryLimit?: number; // Max summaries to generate per run (default: 10)
   budget?: SyncBudget;
+  /**
+   * Replace an indexed archive whose source was rewritten with the admitted
+   * rewrite and rebuild its rows from scratch. A rebuild interrupted after the
+   * archive was replaced is finished by the next indexing run.
+   */
+  replaceDiverged?: boolean;
 }
 
 /**
@@ -186,7 +192,8 @@ function admissionCost(candidate: SyncCandidate): number {
   return archived?.isFile() ? Math.max(0, candidate.size - archived.size) : candidate.size;
 }
 
-type SyncStage = 'admission' | 'index';
+/** A rebuild stage marks an archive whose rows must be replaced before it is trusted again. */
+type SyncStage = 'admission' | 'index' | 'rebuild';
 
 /** Identity, size and time of a regular file; any write or replacement changes it. */
 function fileState(file: string): string | undefined {
@@ -263,6 +270,10 @@ interface SyncState {
   /** Hold an archive only when it still has the state the stopped indexing read. */
   holdArchive(archive: string, readState: string | undefined, currentState: string | undefined, error: Error): void;
   release(stage: SyncStage, file: string): void;
+  /** Mark an archive about to be replaced, so its rows are rebuilt even after an interruption. */
+  markRebuild(archive: string): void;
+  /** Archives whose rows must be rebuilt from scratch. */
+  pendingRebuilds(): string[];
 }
 
 function createSyncState(db: Database.Database, policyDigest: string): SyncState {
@@ -272,6 +283,7 @@ function createSyncState(db: Database.Database, policyDigest: string): SyncState
     'INSERT OR REPLACE INTO sync_holds (stage, path, state, policy, reason, held_at) VALUES (?, ?, ?, ?, ?, ?)'
   );
   const forget = db.prepare('DELETE FROM sync_holds WHERE stage = ? AND path = ?');
+  const rebuilds = db.prepare("SELECT path FROM sync_holds WHERE stage = 'rebuild'");
   const row = (stage: SyncStage, file: string) => {
     const found = find.get(stage, file) as { state: string; policy: string; reason: string } | undefined;
     return found?.policy === policyDigest ? found : undefined;
@@ -322,6 +334,12 @@ function createSyncState(db: Database.Database, policyDigest: string): SyncState
     },
     release(stage, file) {
       forget.run(stage, file);
+    },
+    markRebuild(archive) {
+      record.run('rebuild', archive, '', policyDigest, 'Archive replaced; rows pending rebuild', Date.now());
+    },
+    pendingRebuilds() {
+      return (rebuilds.all() as Array<{ path: string }>).map(entry => entry.path);
     },
   };
 }
@@ -443,7 +461,9 @@ export async function syncConversations(
           if (state && !pastDeadline(budget) && !state.indexed(destFile)) filesToIndex.push(destFile);
         } else {
           const heldFor = state?.heldSource(srcFile, destFile);
-          if (heldFor !== undefined) {
+          // An explicit migration replaces a rewritten archive instead of keeping it.
+          const replacing = options.replaceDiverged === true && heldFor !== undefined && isArchiveDivergence(new Error(heldFor));
+          if (heldFor !== undefined && !replacing) {
             countHeld(result, heldFor);
             continue;
           }
@@ -469,17 +489,34 @@ export async function syncConversations(
           budget.bytes += cost;
           const read = admissionRead(srcFile, destFile);
           // Index rows address archive lines, so an indexed archive keeps its coordinates.
-          const keepCoordinates = state !== undefined && statIfExists(destFile)?.isFile() === true && state.indexed(destFile);
+          const keepCoordinates = !replacing && state !== undefined && statIfExists(destFile)?.isFile() === true && state.indexed(destFile);
+          const admit = (keep: boolean) => archiveAdmittedConversation(srcFile, destFile, exclusions, { keepCoordinates: keep });
+          let rebuilding = false;
           let wasCopied: boolean;
           try {
-            wasCopied = await archiveAdmittedConversation(srcFile, destFile, exclusions, { keepCoordinates });
+            if (replacing) {
+              state?.markRebuild(destFile);
+              rebuilding = true;
+            }
+            try {
+              wasCopied = await admit(keepCoordinates);
+            } catch (error) {
+              if (!(options.replaceDiverged && state && isArchiveDivergence(error))) throw error;
+              // Marked before the archive changes, so an interrupted replacement still rebuilds its rows.
+              state.markRebuild(destFile);
+              rebuilding = true;
+              wasCopied = await admit(false);
+            }
           } catch (error) {
+            // An archive that was not replaced keeps its rows.
+            if (rebuilding) state?.release('rebuild', destFile);
             if (!countHold(result, error)) throw error;
             // A stop on new content fails this run once; the source is then held while it only grows.
             result.errors.push({ file: srcFile, error: (error as Error).message });
             state?.holdSource(srcFile, destFile, read, error as Error);
             continue;
           }
+          if (rebuilding && !wasCopied) state?.release('rebuild', destFile);
           state?.release('admission', srcFile);
           if (wasCopied) {
             result.copied++;
@@ -519,6 +556,16 @@ export async function syncConversations(
         });
       }
     }
+    // Archives replaced under their rows, including by an interrupted earlier run, are rebuilt first.
+    if (state) {
+      const root = path.resolve(destDir) + path.sep;
+      for (const archive of state.pendingRebuilds().reverse()) {
+        if (!path.resolve(archive).startsWith(root)) continue;
+        const at = filesToIndex.indexOf(archive);
+        if (at !== -1) filesToIndex.splice(at, 1);
+        filesToIndex.unshift(archive);
+      }
+    }
   } finally {
     closeState?.();
   }
@@ -551,11 +598,13 @@ export async function syncConversations(
     }
 
     if (embeddings) {
-      const { getExchangesNeedingIndex, initDatabase, insertExchange } = await import('./db.js');
+      const { deleteExchange, getExchangesNeedingIndex, initDatabase, insertExchange } = await import('./db.js');
       const { generateExchangeEmbedding } = embeddings;
 
       const db = initDatabase();
       const indexState = createSyncState(db, policyDigest);
+      const pendingRebuild = new Set(indexState.pendingRebuilds());
+      const archiveRows = db.prepare('SELECT id FROM exchanges WHERE archive_path = ?');
 
       const maxMessageBytes = getMaxMessageBytes();
       let oversizeSkipped = 0;
@@ -581,23 +630,47 @@ export async function syncConversations(
 
           const project = path.basename(path.dirname(file));
           const exchanges = await parseConversation(file, project, file, { archiveRoot: destDir });
-          const newExchanges = getExchangesNeedingIndex(db, file, exchanges);
 
-          for (const exchange of newExchanges) {
-            // Skip oversize single messages BEFORE embedding — a foreign
-            // summarizer's pasted transcript is noise, and embedding it is the
-            // expensive waste (#139).
-            if (isOversizeExchange(exchange, maxMessageBytes)) {
-              oversizeSkipped++;
-              continue;
+          if (pendingRebuild.has(file)) {
+            // The replaced archive's rows address lines it no longer has: embed every
+            // exchange first, then swap all of its rows in one transaction.
+            const prepared: Array<{
+              exchange: typeof exchanges[number];
+              embedding: Awaited<ReturnType<typeof generateExchangeEmbedding>>;
+              toolNames?: string[];
+            }> = [];
+            for (const exchange of exchanges) {
+              if (isOversizeExchange(exchange, maxMessageBytes)) {
+                oversizeSkipped++;
+                continue;
+              }
+              const toolNames = exchange.toolCalls?.map(tc => tc.toolName);
+              prepared.push({ exchange, toolNames, embedding: await generateExchangeEmbedding(exchange.userMessage, exchange.assistantMessage, toolNames) });
             }
-            const toolNames = exchange.toolCalls?.map(tc => tc.toolName);
-            const embedding = await generateExchangeEmbedding(
-              exchange.userMessage,
-              exchange.assistantMessage,
-              toolNames
-            );
-            insertExchange(db, exchange, embedding, toolNames);
+            db.transaction(() => {
+              for (const { id } of archiveRows.all(file) as Array<{ id: string }>) deleteExchange(db, id);
+              for (const entry of prepared) insertExchange(db, entry.exchange, entry.embedding, entry.toolNames);
+            })();
+            indexState.release('rebuild', file);
+          } else {
+            const newExchanges = getExchangesNeedingIndex(db, file, exchanges);
+
+            for (const exchange of newExchanges) {
+              // Skip oversize single messages BEFORE embedding — a foreign
+              // summarizer's pasted transcript is noise, and embedding it is the
+              // expensive waste (#139).
+              if (isOversizeExchange(exchange, maxMessageBytes)) {
+                oversizeSkipped++;
+                continue;
+              }
+              const toolNames = exchange.toolCalls?.map(tc => tc.toolName);
+              const embedding = await generateExchangeEmbedding(
+                exchange.userMessage,
+                exchange.assistantMessage,
+                toolNames
+              );
+              insertExchange(db, exchange, embedding, toolNames);
+            }
           }
 
           result.indexed++;
