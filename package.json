@@ -1,6 +1,6 @@
 {
   "name": "episodic-memory",
-  "version": "1.6.0+codex.20261015131215",
+  "version": "1.6.0+codex.20261015145935",
   "description": "Semantic search for supported coding-agent conversations",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

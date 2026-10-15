@@ -33811,7 +33811,7 @@ function formatCursorConversationAsMarkdown(lines) {
 }
 
 // src/version.ts
-var VERSION = "1.6.0+codex.20261015131215";
+var VERSION = "1.6.0+codex.20261015145935";
 
 // src/mcp-server.ts
 import fs5 from "fs";
