@@ -119,26 +119,104 @@ function fileState(file) {
         return undefined;
     }
 }
-/** Admission reads a source against its existing archive, so either changing ends a hold. */
-function admissionState(source, archive) {
-    const sourceState = fileState(source);
-    return sourceState === undefined ? undefined : `${sourceState}|${fileState(archive) ?? ''}`;
+function admissionRead(source, archive) {
+    try {
+        const info = fs.lstatSync(source);
+        return info.isFile() ? { source: info, archive: fileState(archive) ?? '' } : undefined;
+    }
+    catch {
+        return undefined;
+    }
+}
+function digestPrefix(file, size) {
+    let fd;
+    try {
+        fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+        const hash = crypto.createHash('sha256');
+        const buffer = Buffer.allocUnsafe(1 << 20);
+        for (let position = 0; position < size;) {
+            const read = fs.readSync(fd, buffer, 0, Math.min(buffer.length, size - position), position);
+            if (read <= 0)
+                return undefined;
+            hash.update(buffer.subarray(0, read));
+            position += read;
+        }
+        return hash.digest('hex');
+    }
+    catch {
+        return undefined;
+    }
+    finally {
+        if (fd !== undefined)
+            fs.closeSync(fd);
+    }
 }
 function createSyncState(db, policyDigest) {
     const indexed = db.prepare('SELECT 1 FROM exchanges WHERE archive_path = ? LIMIT 1');
     const find = db.prepare('SELECT state, policy, reason FROM sync_holds WHERE stage = ? AND path = ?');
     const record = db.prepare('INSERT OR REPLACE INTO sync_holds (stage, path, state, policy, reason, held_at) VALUES (?, ?, ?, ?, ?, ?)');
     const forget = db.prepare('DELETE FROM sync_holds WHERE stage = ? AND path = ?');
+    const row = (stage, file) => {
+        const found = find.get(stage, file);
+        return found?.policy === policyDigest ? found : undefined;
+    };
     return {
         indexed: archive => indexed.get(archive) !== undefined,
-        held(stage, file, state) {
-            const row = find.get(stage, file);
-            return row !== undefined && state !== undefined && row.policy === policyDigest && row.state === state
-                ? row.reason : undefined;
+        heldSource(source, archive) {
+            const found = row('admission', source);
+            if (!found)
+                return undefined;
+            let hold;
+            let info;
+            try {
+                hold = JSON.parse(found.state);
+                info = fs.lstatSync(source);
+            }
+            catch {
+                return undefined;
+            }
+            if (!info.isFile() || info.dev !== hold.dev || info.ino !== hold.ino || info.size < hold.size)
+                return undefined;
+            if ((fileState(archive) ?? '') !== hold.archive)
+                return undefined;
+            if (info.size === hold.seenSize && info.mtimeMs === hold.seenMtimeMs)
+                return found.reason;
+            if (digestPrefix(source, hold.size) !== hold.sha256)
+                return undefined;
+            const seen = { ...hold, seenSize: info.size, seenMtimeMs: info.mtimeMs };
+            record.run('admission', source, JSON.stringify(seen), policyDigest, found.reason, Date.now());
+            return found.reason;
         },
-        hold(stage, file, readState, currentState, error) {
+        holdSource(source, archive, read, error) {
+            if (!read)
+                return;
+            let info;
+            try {
+                info = fs.lstatSync(source);
+            }
+            catch {
+                return;
+            }
+            if (!info.isFile() || info.dev !== read.source.dev || info.ino !== read.source.ino || info.size < read.source.size)
+                return;
+            if ((fileState(archive) ?? '') !== read.archive)
+                return;
+            const sha256 = digestPrefix(source, read.source.size);
+            if (sha256 === undefined)
+                return;
+            const hold = {
+                dev: info.dev, ino: info.ino, size: read.source.size, sha256,
+                seenSize: info.size, seenMtimeMs: info.mtimeMs, archive: read.archive,
+            };
+            record.run('admission', source, JSON.stringify(hold), policyDigest, error.message, Date.now());
+        },
+        heldArchive(archive, state) {
+            const found = row('index', archive);
+            return found !== undefined && state !== undefined && found.state === state ? found.reason : undefined;
+        },
+        holdArchive(archive, readState, currentState, error) {
             if (readState !== undefined && readState === currentState) {
-                record.run(stage, file, readState, policyDigest, error.message, Date.now());
+                record.run('index', archive, readState, policyDigest, error.message, Date.now());
             }
         },
         release(stage, file) {
@@ -252,7 +330,7 @@ export async function syncConversations(sourceDir, destDir, options = {}) {
                         filesToIndex.push(destFile);
                 }
                 else {
-                    const heldFor = state?.held('admission', srcFile, admissionState(srcFile, destFile));
+                    const heldFor = state?.heldSource(srcFile, destFile);
                     if (heldFor !== undefined) {
                         countHeld(result, heldFor);
                         continue;
@@ -275,7 +353,7 @@ export async function syncConversations(sourceDir, destDir, options = {}) {
                     }
                     budget.files++;
                     budget.bytes += cost;
-                    const readState = admissionState(srcFile, destFile);
+                    const read = admissionRead(srcFile, destFile);
                     // Index rows address archive lines, so an indexed archive keeps its coordinates.
                     const keepCoordinates = state !== undefined && statIfExists(destFile)?.isFile() === true && state.indexed(destFile);
                     let wasCopied;
@@ -285,9 +363,9 @@ export async function syncConversations(sourceDir, destDir, options = {}) {
                     catch (error) {
                         if (!countHold(result, error))
                             throw error;
-                        // A stop on new content fails this run once; the unchanged file is then held, not retried.
+                        // A stop on new content fails this run once; the source is then held while it only grows.
                         result.errors.push({ file: srcFile, error: error.message });
-                        state?.hold('admission', srcFile, readState, admissionState(srcFile, destFile), error);
+                        state?.holdSource(srcFile, destFile, read, error);
                         continue;
                     }
                     state?.release('admission', srcFile);
@@ -373,7 +451,7 @@ export async function syncConversations(sourceDir, destDir, options = {}) {
                     continue;
                 }
                 const readState = fileState(file);
-                const heldFor = indexState.held('index', file, readState);
+                const heldFor = indexState.heldArchive(file, readState);
                 if (heldFor !== undefined) {
                     countHeld(result, heldFor);
                     continue;
@@ -381,7 +459,7 @@ export async function syncConversations(sourceDir, destDir, options = {}) {
                 try {
                     // Check for DO NOT INDEX marker
                     if (shouldSkipConversation(file)) {
-                        indexState.hold('index', file, readState, fileState(file), new Error(NOTHING_TO_INDEX));
+                        indexState.holdArchive(file, readState, fileState(file), new Error(NOTHING_TO_INDEX));
                         continue; // Skip indexing but file is already copied
                     }
                     const project = path.basename(path.dirname(file));
@@ -404,12 +482,12 @@ export async function syncConversations(sourceDir, destDir, options = {}) {
                     if (indexState.indexed(file))
                         indexState.release('index', file);
                     else
-                        indexState.hold('index', file, readState, fileState(file), new Error(NOTHING_TO_INDEX));
+                        indexState.holdArchive(file, readState, fileState(file), new Error(NOTHING_TO_INDEX));
                 }
                 catch (error) {
                     // Held or not, a stop on new content fails this run once, like any indexing error.
                     if (countHold(result, error))
-                        indexState.hold('index', file, readState, fileState(file), error);
+                        indexState.holdArchive(file, readState, fileState(file), error);
                     result.errors.push({
                         file,
                         error: error instanceof Error ? error.message : String(error)

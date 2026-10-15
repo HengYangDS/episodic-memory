@@ -97,7 +97,7 @@ describe('archives written before the current policy', () => {
 });
 
 describe('refusal memory', () => {
-  it('does not screen refused content again until the source changes', async () => {
+  it('holds refused content while the source only grows, and retries a rewrite', async () => {
     writePolicy(fixture);
     const source = rollout(day, 1, codexLines(session(1), 2, 1, FLAGGED), ago(60));
 
@@ -112,11 +112,17 @@ describe('refusal memory', () => {
     expect(second).toMatchObject({ refused: 1, errors: [] });
     expect(screenedRecords(fixture)).toBe(screened);
 
+    // The refused records are still the source's first bytes, so a live conversation stays held.
     fs.appendFileSync(source, codexLines(session(1), 1, 3));
     bump(source);
-    const third = await sync();
-    expect(third.refused).toBe(1);
-    expect(third.errors).toHaveLength(1);
+    expect(await sync()).toMatchObject({ refused: 1, errors: [] });
+    expect(screenedRecords(fixture)).toBe(screened);
+
+    fs.writeFileSync(source, fs.readFileSync(source, 'utf8').replace('question 1', 'question one'));
+    bump(source, 10);
+    const rewritten = await sync();
+    expect(rewritten.refused).toBe(1);
+    expect(rewritten.errors).toHaveLength(1);
     expect(screenedRecords(fixture)).toBeGreaterThan(screened);
   });
 
@@ -205,6 +211,12 @@ describe('rewritten sources', () => {
     expect(holdRows()).toBe(1);
 
     expect(await sync()).toMatchObject({ diverged: 1, errors: [] });
+
+    // A rewritten live session that keeps growing stays held without another report.
+    fs.appendFileSync(source, codexLines(session(1), 1, 4));
+    bump(source, 10);
+    expect(await sync()).toMatchObject({ diverged: 1, errors: [] });
+    expect(fs.readFileSync(archive, 'utf8')).toBe(previous);
   });
 
   it('replaces a rewritten archive that no index rows reference', async () => {

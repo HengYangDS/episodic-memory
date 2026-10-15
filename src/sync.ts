@@ -198,19 +198,70 @@ function fileState(file: string): string | undefined {
   }
 }
 
-/** Admission reads a source against its existing archive, so either changing ends a hold. */
-function admissionState(source: string, archive: string): string | undefined {
-  const sourceState = fileState(source);
-  return sourceState === undefined ? undefined : `${sourceState}|${fileState(archive) ?? ''}`;
+/** The source bytes and archive an admission is about to compare. */
+interface AdmissionRead {
+  source: fs.Stats;
+  archive: string;
+}
+
+function admissionRead(source: string, archive: string): AdmissionRead | undefined {
+  try {
+    const info = fs.lstatSync(source);
+    return info.isFile() ? { source: info, archive: fileState(archive) ?? '' } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Where admission stopped on a source. A refusal or divergence lies in the
+ * bytes admission read, so the hold also covers the source's appended growth:
+ * it lasts while the source still starts with exactly those bytes and its
+ * archive is unchanged. A live conversation is then neither screened nor
+ * reported again on every run while it grows.
+ */
+interface SourceHold {
+  dev: number;
+  ino: number;
+  size: number;
+  sha256: string;
+  /** The last state found held, accepted again without reading the source. */
+  seenSize: number;
+  seenMtimeMs: number;
+  archive: string;
+}
+
+function digestPrefix(file: string, size: number): string | undefined {
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    const hash = crypto.createHash('sha256');
+    const buffer = Buffer.allocUnsafe(1 << 20);
+    for (let position = 0; position < size;) {
+      const read = fs.readSync(fd, buffer, 0, Math.min(buffer.length, size - position), position);
+      if (read <= 0) return undefined;
+      hash.update(buffer.subarray(0, read));
+      position += read;
+    }
+    return hash.digest('hex');
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
 }
 
 /** Index lookups and holds over one index connection. */
 interface SyncState {
   indexed(archive: string): boolean;
-  /** Why a stage stopped on this file in exactly this state under this policy, if it did. */
-  held(stage: SyncStage, file: string, state: string | undefined): string | undefined;
-  /** Hold a file only when it still has the state the stopped stage read. */
-  hold(stage: SyncStage, file: string, readState: string | undefined, currentState: string | undefined, error: Error): void;
+  /** Why admission stopped on this source, if it only grew since and its archive is unchanged. */
+  heldSource(source: string, archive: string): string | undefined;
+  /** Hold a source on the bytes the stopped admission read. */
+  holdSource(source: string, archive: string, read: AdmissionRead | undefined, error: Error): void;
+  /** Why indexing stopped on this archive in exactly this state, if it did. */
+  heldArchive(archive: string, state: string | undefined): string | undefined;
+  /** Hold an archive only when it still has the state the stopped indexing read. */
+  holdArchive(archive: string, readState: string | undefined, currentState: string | undefined, error: Error): void;
   release(stage: SyncStage, file: string): void;
 }
 
@@ -221,16 +272,52 @@ function createSyncState(db: Database.Database, policyDigest: string): SyncState
     'INSERT OR REPLACE INTO sync_holds (stage, path, state, policy, reason, held_at) VALUES (?, ?, ?, ?, ?, ?)'
   );
   const forget = db.prepare('DELETE FROM sync_holds WHERE stage = ? AND path = ?');
+  const row = (stage: SyncStage, file: string) => {
+    const found = find.get(stage, file) as { state: string; policy: string; reason: string } | undefined;
+    return found?.policy === policyDigest ? found : undefined;
+  };
   return {
     indexed: archive => indexed.get(archive) !== undefined,
-    held(stage, file, state) {
-      const row = find.get(stage, file) as { state: string; policy: string; reason: string } | undefined;
-      return row !== undefined && state !== undefined && row.policy === policyDigest && row.state === state
-        ? row.reason : undefined;
+    heldSource(source, archive) {
+      const found = row('admission', source);
+      if (!found) return undefined;
+      let hold: SourceHold;
+      let info: fs.Stats;
+      try {
+        hold = JSON.parse(found.state) as SourceHold;
+        info = fs.lstatSync(source);
+      } catch {
+        return undefined;
+      }
+      if (!info.isFile() || info.dev !== hold.dev || info.ino !== hold.ino || info.size < hold.size) return undefined;
+      if ((fileState(archive) ?? '') !== hold.archive) return undefined;
+      if (info.size === hold.seenSize && info.mtimeMs === hold.seenMtimeMs) return found.reason;
+      if (digestPrefix(source, hold.size) !== hold.sha256) return undefined;
+      const seen: SourceHold = { ...hold, seenSize: info.size, seenMtimeMs: info.mtimeMs };
+      record.run('admission', source, JSON.stringify(seen), policyDigest, found.reason, Date.now());
+      return found.reason;
     },
-    hold(stage, file, readState, currentState, error) {
+    holdSource(source, archive, read, error) {
+      if (!read) return;
+      let info: fs.Stats;
+      try { info = fs.lstatSync(source); } catch { return; }
+      if (!info.isFile() || info.dev !== read.source.dev || info.ino !== read.source.ino || info.size < read.source.size) return;
+      if ((fileState(archive) ?? '') !== read.archive) return;
+      const sha256 = digestPrefix(source, read.source.size);
+      if (sha256 === undefined) return;
+      const hold: SourceHold = {
+        dev: info.dev, ino: info.ino, size: read.source.size, sha256,
+        seenSize: info.size, seenMtimeMs: info.mtimeMs, archive: read.archive,
+      };
+      record.run('admission', source, JSON.stringify(hold), policyDigest, error.message, Date.now());
+    },
+    heldArchive(archive, state) {
+      const found = row('index', archive);
+      return found !== undefined && state !== undefined && found.state === state ? found.reason : undefined;
+    },
+    holdArchive(archive, readState, currentState, error) {
       if (readState !== undefined && readState === currentState) {
-        record.run(stage, file, readState, policyDigest, error.message, Date.now());
+        record.run('index', archive, readState, policyDigest, error.message, Date.now());
       }
     },
     release(stage, file) {
@@ -355,7 +442,7 @@ export async function syncConversations(
           // An archive whose indexing never completed is indexed from its archive copy.
           if (state && !pastDeadline(budget) && !state.indexed(destFile)) filesToIndex.push(destFile);
         } else {
-          const heldFor = state?.held('admission', srcFile, admissionState(srcFile, destFile));
+          const heldFor = state?.heldSource(srcFile, destFile);
           if (heldFor !== undefined) {
             countHeld(result, heldFor);
             continue;
@@ -380,7 +467,7 @@ export async function syncConversations(
 
           budget.files++;
           budget.bytes += cost;
-          const readState = admissionState(srcFile, destFile);
+          const read = admissionRead(srcFile, destFile);
           // Index rows address archive lines, so an indexed archive keeps its coordinates.
           const keepCoordinates = state !== undefined && statIfExists(destFile)?.isFile() === true && state.indexed(destFile);
           let wasCopied: boolean;
@@ -388,9 +475,9 @@ export async function syncConversations(
             wasCopied = await archiveAdmittedConversation(srcFile, destFile, exclusions, { keepCoordinates });
           } catch (error) {
             if (!countHold(result, error)) throw error;
-            // A stop on new content fails this run once; the unchanged file is then held, not retried.
+            // A stop on new content fails this run once; the source is then held while it only grows.
             result.errors.push({ file: srcFile, error: (error as Error).message });
-            state?.hold('admission', srcFile, readState, admissionState(srcFile, destFile), error as Error);
+            state?.holdSource(srcFile, destFile, read, error as Error);
             continue;
           }
           state?.release('admission', srcFile);
@@ -480,7 +567,7 @@ export async function syncConversations(
           continue;
         }
         const readState = fileState(file);
-        const heldFor = indexState.held('index', file, readState);
+        const heldFor = indexState.heldArchive(file, readState);
         if (heldFor !== undefined) {
           countHeld(result, heldFor);
           continue;
@@ -488,7 +575,7 @@ export async function syncConversations(
         try {
           // Check for DO NOT INDEX marker
           if (shouldSkipConversation(file)) {
-            indexState.hold('index', file, readState, fileState(file), new Error(NOTHING_TO_INDEX));
+            indexState.holdArchive(file, readState, fileState(file), new Error(NOTHING_TO_INDEX));
             continue; // Skip indexing but file is already copied
           }
 
@@ -516,10 +603,10 @@ export async function syncConversations(
           result.indexed++;
           // Without a hold, an archive that still has no rows would be parsed again on every run.
           if (indexState.indexed(file)) indexState.release('index', file);
-          else indexState.hold('index', file, readState, fileState(file), new Error(NOTHING_TO_INDEX));
+          else indexState.holdArchive(file, readState, fileState(file), new Error(NOTHING_TO_INDEX));
         } catch (error) {
           // Held or not, a stop on new content fails this run once, like any indexing error.
-          if (countHold(result, error)) indexState.hold('index', file, readState, fileState(file), error as Error);
+          if (countHold(result, error)) indexState.holdArchive(file, readState, fileState(file), error as Error);
           result.errors.push({
             file,
             error: error instanceof Error ? error.message : String(error)
