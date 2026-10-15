@@ -67,6 +67,10 @@ export function createSyncBudget(limits = {}) {
 function pastDeadline(budget) {
     return budget.limits.deadlineMs !== undefined && Date.now() >= budget.limits.deadlineMs;
 }
+function pastAdmissionDeadline(budget) {
+    const deadline = budget.limits.admissionDeadlineMs ?? budget.limits.deadlineMs;
+    return deadline !== undefined && Date.now() >= deadline;
+}
 /**
  * Derive sync options from the process environment.
  *
@@ -161,11 +165,14 @@ function countHold(result, error) {
     return true;
 }
 function countHeld(result, reason) {
-    if (isArchiveDivergence(new Error(reason)))
+    const held = new Error(reason);
+    if (isArchiveDivergence(held))
         result.diverged++;
-    else
+    else if (isScreeningRefusal(held))
         result.refused++;
 }
+/** An archive whose exchanges are all empty, oversize or opted out gets no rows, so a row lookup cannot tell it was indexed. */
+const NOTHING_TO_INDEX = 'Conversation has nothing to index';
 export async function syncConversations(sourceDir, destDir, options = {}) {
     const exclusions = readRecordExclusions();
     const exclusionsChangedMs = recordExclusionsChangedMs();
@@ -255,7 +262,7 @@ export async function syncConversations(sourceDir, destDir, options = {}) {
                         result.deferredOversize++;
                         continue;
                     }
-                    if (pastDeadline(budget) || (maxFiles !== undefined && budget.files >= maxFiles) ||
+                    if (pastAdmissionDeadline(budget) || (maxFiles !== undefined && budget.files >= maxFiles) ||
                         (maxBytes !== undefined && budget.bytes + cost > maxBytes)) {
                         result.deferred++;
                         continue;
@@ -372,6 +379,7 @@ export async function syncConversations(sourceDir, destDir, options = {}) {
                 try {
                     // Check for DO NOT INDEX marker
                     if (shouldSkipConversation(file)) {
+                        indexState.hold('index', file, readState, fileState(file), new Error(NOTHING_TO_INDEX));
                         continue; // Skip indexing but file is already copied
                     }
                     const project = path.basename(path.dirname(file));
@@ -390,7 +398,11 @@ export async function syncConversations(sourceDir, destDir, options = {}) {
                         insertExchange(db, exchange, embedding, toolNames);
                     }
                     result.indexed++;
-                    indexState.release('index', file);
+                    // Without a hold, an archive that still has no rows would be parsed again on every run.
+                    if (indexState.indexed(file))
+                        indexState.release('index', file);
+                    else
+                        indexState.hold('index', file, readState, fileState(file), new Error(NOTHING_TO_INDEX));
                 }
                 catch (error) {
                     if (countHold(result, error)) {

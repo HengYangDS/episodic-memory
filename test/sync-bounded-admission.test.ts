@@ -161,6 +161,20 @@ describe('whole-operation sync budget', () => {
     expect(result.copied).toBe(0);
     expect(result.deferred).toBe(1);
   });
+
+  it('keeps indexing admitted archives after the admission deadline', async () => {
+    const day = path.join(sourceDir, '2026', '10', '15');
+    const admitted = rollout(day, 1, codexLines(session(1), 1), ago(20));
+    await syncConversations(sourceDir, destDir, { skipSummaries: true, skipIndex: true });
+    rollout(day, 2, codexLines(session(2), 1), ago(10));
+
+    const result = await syncConversations(sourceDir, destDir, {
+      skipSummaries: true,
+      budget: createSyncBudget({ admissionDeadlineMs: Date.now() - 1, deadlineMs: Date.now() + 60_000 }),
+    });
+    expect(result).toMatchObject({ copied: 0, deferred: 1, indexed: 1 });
+    expect(fs.existsSync(path.join(destDir, '2026', '10', '15', path.basename(admitted)))).toBe(true);
+  });
 });
 
 describe.skipIf(!zstdAvailable)('compressed Codex sources', () => {

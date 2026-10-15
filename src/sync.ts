@@ -101,6 +101,11 @@ export interface SyncLimits {
   maxFileBytes?: number;
   /** Epoch milliseconds after which no new admission or indexing starts. */
   deadlineMs?: number;
+  /**
+   * Epoch milliseconds after which no new admission starts, so the rest of the
+   * window indexes what was admitted. Defaults to `deadlineMs`.
+   */
+  admissionDeadlineMs?: number;
 }
 
 /** One budget shared by every source directory of a sync run. */
@@ -116,6 +121,11 @@ export function createSyncBudget(limits: SyncLimits = {}): SyncBudget {
 
 function pastDeadline(budget: SyncBudget): boolean {
   return budget.limits.deadlineMs !== undefined && Date.now() >= budget.limits.deadlineMs;
+}
+
+function pastAdmissionDeadline(budget: SyncBudget): boolean {
+  const deadline = budget.limits.admissionDeadlineMs ?? budget.limits.deadlineMs;
+  return deadline !== undefined && Date.now() >= deadline;
 }
 
 export interface SyncOptions {
@@ -242,9 +252,13 @@ function countHold(result: SyncResult, error: unknown): boolean {
 }
 
 function countHeld(result: SyncResult, reason: string): void {
-  if (isArchiveDivergence(new Error(reason))) result.diverged++;
-  else result.refused++;
+  const held = new Error(reason);
+  if (isArchiveDivergence(held)) result.diverged++;
+  else if (isScreeningRefusal(held)) result.refused++;
 }
+
+/** An archive whose exchanges are all empty, oversize or opted out gets no rows, so a row lookup cannot tell it was indexed. */
+const NOTHING_TO_INDEX = 'Conversation has nothing to index';
 
 export async function syncConversations(
   sourceDir: string,
@@ -347,7 +361,7 @@ export async function syncConversations(
             result.deferredOversize++;
             continue;
           }
-          if (pastDeadline(budget) || (maxFiles !== undefined && budget.files >= maxFiles) ||
+          if (pastAdmissionDeadline(budget) || (maxFiles !== undefined && budget.files >= maxFiles) ||
               (maxBytes !== undefined && budget.bytes + cost > maxBytes)) {
             result.deferred++;
             continue;
@@ -468,6 +482,7 @@ export async function syncConversations(
         try {
           // Check for DO NOT INDEX marker
           if (shouldSkipConversation(file)) {
+            indexState.hold('index', file, readState, fileState(file), new Error(NOTHING_TO_INDEX));
             continue; // Skip indexing but file is already copied
           }
 
@@ -493,7 +508,9 @@ export async function syncConversations(
           }
 
           result.indexed++;
-          indexState.release('index', file);
+          // Without a hold, an archive that still has no rows would be parsed again on every run.
+          if (indexState.indexed(file)) indexState.release('index', file);
+          else indexState.hold('index', file, readState, fileState(file), new Error(NOTHING_TO_INDEX));
         } catch (error) {
           if (countHold(result, error)) {
             indexState.hold('index', file, readState, fileState(file), error as Error);

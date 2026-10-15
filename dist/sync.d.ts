@@ -31,6 +31,11 @@ export interface SyncLimits {
     maxFileBytes?: number;
     /** Epoch milliseconds after which no new admission or indexing starts. */
     deadlineMs?: number;
+    /**
+     * Epoch milliseconds after which no new admission starts, so the rest of the
+     * window indexes what was admitted. Defaults to `deadlineMs`.
+     */
+    admissionDeadlineMs?: number;
 }
 /** One budget shared by every source directory of a sync run. */
 export interface SyncBudget {

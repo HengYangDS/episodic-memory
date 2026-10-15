@@ -55,7 +55,7 @@ OPTIONS:
   --max-files N       Max transcripts to admit this run (background default: 50)
   --max-bytes N       Max transcript bytes to admit this run (background default: 256 MiB)
   --max-file-bytes N  Defer a transcript whose admission exceeds N bytes (background default: 128 MiB)
-  --max-seconds N     Start no new admission after N seconds (background default: 300)
+  --max-seconds N     Start no new work after N seconds; admission stops after two thirds of them (background default: 300)
 
 EXAMPLES:
   # Sync all new conversations
@@ -142,11 +142,14 @@ function parseSyncLimits(background) {
     const maxSeconds = parseNonNegativeOption('--max-seconds');
     const defaults = background ? BACKGROUND_SYNC_LIMITS : {};
     const seconds = maxSeconds ?? defaults.maxSeconds;
+    const start = Date.now();
     return {
         maxFiles: maxFiles ?? defaults.maxFiles,
         maxBytes: maxBytes ?? defaults.maxBytes,
         maxFileBytes: maxFileBytes ?? defaults.maxFileBytes,
-        deadlineMs: seconds === undefined ? undefined : Date.now() + seconds * 1000,
+        deadlineMs: seconds === undefined ? undefined : start + seconds * 1000,
+        // Admission screens and indexing embeds; the last third of the window indexes what was admitted.
+        admissionDeadlineMs: seconds === undefined ? undefined : start + Math.floor(seconds * 1000 * 2 / 3),
     };
 }
 const BACKGROUND_SYNC_LIMITS = {

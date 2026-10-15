@@ -29,9 +29,9 @@ let archiveDay: string;
 const sync = () => syncConversations(fixture.sourceDir, fixture.destDir, { skipSummaries: true });
 const pause = () => new Promise(resolve => setTimeout(resolve, 20));
 
-function holdRows(): number {
+function holdRows(stage = 'admission'): number {
   const db = new Database(process.env.EPISODIC_MEMORY_DB_PATH!, { readonly: true });
-  try { return (db.prepare('SELECT COUNT(*) AS count FROM sync_holds').get() as { count: number }).count; }
+  try { return (db.prepare('SELECT COUNT(*) AS count FROM sync_holds WHERE stage = ?').get(stage) as { count: number }).count; }
   finally { db.close(); }
 }
 
@@ -140,6 +140,7 @@ describe('refusal memory', () => {
 
     const first = await sync();
     expect(first).toMatchObject({ copied: 0, indexed: 0, refused: 1, errors: [] });
+    expect(holdRows('index')).toBe(1);
     const screened = screenedRecords(fixture);
 
     const second = await sync();
@@ -156,6 +157,22 @@ describe('refusal memory', () => {
     fs.rmSync(source);
     await sync();
     expect(holdRows()).toBe(0);
+  });
+
+  it('does not parse an unchanged archive without indexable exchanges again', async () => {
+    const unanswered = JSON.stringify({ type: 'session_meta', payload: { id: session(1), cwd: '/synthetic' } }) + '\n' +
+      JSON.stringify({ type: 'response_item', payload: { type: 'message', role: 'user',
+        content: [{ type: 'input_text', text: 'unanswered question' }] } }) + '\n';
+    const source = rollout(day, 1, unanswered, ago(60));
+    expect((await sync()).indexed).toBe(1);
+    expect(holdRows('index')).toBe(1);
+    expect((await sync()).indexed).toBe(0);
+
+    fs.appendFileSync(source, codexLines(session(1), 1, 2));
+    bump(source);
+    expect((await sync()).indexed).toBe(1);
+    expect(embedSpy).toHaveBeenCalled();
+    expect(holdRows('index')).toBe(0);
   });
 });
 
