@@ -1,1 +1,1 @@
-export declare const VERSION = "1.6.0+codex.20261015122541";
+export declare const VERSION = "1.6.0+codex.20261015131215";
