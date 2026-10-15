@@ -9,7 +9,7 @@
     {
       "name": "episodic-memory",
       "description": "Semantic search for supported coding-agent conversations. Remember past discussions, decisions, and patterns.",
-      "version": "1.6.0+codex.20261015155528",
+      "version": "1.6.0+codex.20261015163925",
       "source": "./",
       "author": {
         "name": "Jesse Vincent",
