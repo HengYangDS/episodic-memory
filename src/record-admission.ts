@@ -1127,7 +1127,7 @@ export function archiveScreenedUnderPolicy(archive: string, archiveRoot: string,
 }
 
 async function* physicalLines(file: string, fd: number): AsyncGenerator<PhysicalLine> {
-  const reader = conversationByteStream(file, fd, false);
+  const reader = conversationByteStream(file, fd, isCompressedConversation(file));
   let pending = Buffer.alloc(0);
   try {
     for await (const chunk of reader.stream) {
@@ -1205,6 +1205,57 @@ async function verifyAdmittedPrefix(source: string, archive: string, policy: Rec
   }
 }
 
+const ARCHIVE_DIVERGED = 'Conversation source no longer holds its archived lines';
+
+/** True when admission kept an archive because its source was rewritten under it. */
+export function isArchiveDivergence(error: unknown): boolean {
+  return error instanceof Error && error.message === ARCHIVE_DIVERGED;
+}
+
+/**
+ * True when the source still holds every line of an existing archive at the
+ * same coordinate: each archived line is the source line itself, its filtered
+ * form, a withheld blank, or the unterminated start of that line. Index rows
+ * address archive lines, so a rewritten source must not replace an archive
+ * that rows still reference.
+ */
+async function keepsArchiveCoordinates(source: string, archive: string, policy: RecordExclusions | null): Promise<boolean> {
+  const transcript = conversationTranscriptName(source);
+  const decoder = new TextDecoder('utf-8', { fatal: true });
+  const identity: IdentityState = { sessionId: sessionFromPath(source), identitySeen: false };
+  const sourceFd = fs.openSync(source, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  let archiveFd: number | undefined;
+  try {
+    archiveFd = fs.openSync(archive, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    const originals = physicalLines(source, sourceFd);
+    let line = 0;
+    try {
+      for await (const archived of physicalLines(archive, archiveFd)) {
+        const next = await originals.next();
+        if (next.done) return false;
+        const original = next.value.bytes;
+        const crlf = original.at(-1) === 13;
+        line++;
+        let text: string;
+        try { text = decoder.decode(crlf ? original.subarray(0, -1) : original); }
+        catch { return false; }
+        observeRecordIdentity(text, identity, policy);
+        if (archived.bytes.length === 0 || (archived.bytes.length === 1 && archived.bytes[0] === 13)) continue;
+        if (archived.bytes.equals(original)) continue;
+        if (!archived.terminated && original.subarray(0, archived.bytes.length).equals(archived.bytes)) continue;
+        const filtered = Buffer.from(filterRecord(text, line, policy, transcript, identity.sessionId) + (crlf ? '\r' : ''));
+        if (!filtered.equals(archived.bytes)) return false;
+      }
+      return true;
+    } finally {
+      await originals.return(undefined);
+    }
+  } finally {
+    fs.closeSync(sourceFd);
+    if (archiveFd !== undefined) fs.closeSync(archiveFd);
+  }
+}
+
 function suffixHasExclusionMarker(source: string, offset: number): boolean {
   let fd: number | undefined;
   try {
@@ -1269,13 +1320,22 @@ async function appendAdmittedConversation(source: string, destination: string, p
   } finally { if (fs.existsSync(temp)) fs.unlinkSync(temp); }
 }
 
-/** Publish only admitted bytes. Never write an unfiltered temporary copy. */
-export async function archiveAdmittedConversation(source: string, destination: string, policy = readRecordExclusions()): Promise<boolean> {
+/**
+ * Publish only admitted bytes. Never write an unfiltered temporary copy.
+ * With `keepCoordinates`, an existing archive is replaced only by an admitted
+ * form that keeps all of its lines where they are.
+ */
+export async function archiveAdmittedConversation(source: string, destination: string, policy = readRecordExclusions(),
+  options: { keepCoordinates?: boolean } = {}): Promise<boolean> {
   const policySnapshot = JSON.stringify(policy);
   assertUnchangedPolicy(policySnapshot);
   // An unchanged archive needs neither a marker scan nor screening.
   const policyChangedMs = recordExclusionsChangedMs();
   if (archiveIsCurrent(source, destination, policy, policyChangedMs)) return false;
+  // Checked before screening: a rewritten source would only be screened to be kept out.
+  if (options.keepCoordinates && fs.existsSync(destination) && !(await keepsArchiveCoordinates(source, destination, policy))) {
+    throw new Error(ARCHIVE_DIVERGED);
+  }
   const compressed = isCompressedConversation(source);
   if (!compressed && path.resolve(source) !== path.resolve(destination)) {
     let eligible = false;

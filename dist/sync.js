@@ -1,6 +1,6 @@
 import fs from 'fs';
 import crypto from 'crypto';
-import { archiveAdmittedConversation, archiveIsCurrent, conversationLines, isCompressedConversation, isScreeningRefusal, readRecordExclusions, recordExclusionsChangedMs, } from './record-admission.js';
+import { archiveAdmittedConversation, archiveIsCurrent, conversationLines, isCompressedConversation, isArchiveDivergence, isScreeningRefusal, readRecordExclusions, recordExclusionsChangedMs, } from './record-admission.js';
 import path from 'path';
 import { archivedRolloutRelativePath, getExcludedProjects, findJsonlFiles, statIfExists } from './paths.js';
 import { formatErrorSentinel, shouldQueueForSummary } from './summary-sentinel.js';
@@ -115,34 +115,56 @@ function fileState(file) {
         return undefined;
     }
 }
+/** Admission reads a source against its existing archive, so either changing ends a hold. */
+function admissionState(source, archive) {
+    const sourceState = fileState(source);
+    return sourceState === undefined ? undefined : `${sourceState}|${fileState(archive) ?? ''}`;
+}
 function createSyncState(db, policyDigest) {
     const indexed = db.prepare('SELECT 1 FROM exchanges WHERE archive_path = ? LIMIT 1');
-    const find = db.prepare('SELECT state, policy FROM sync_refusals WHERE stage = ? AND path = ?');
-    const record = db.prepare('INSERT OR REPLACE INTO sync_refusals (stage, path, state, policy, reason, refused_at) VALUES (?, ?, ?, ?, ?, ?)');
-    const forget = db.prepare('DELETE FROM sync_refusals WHERE stage = ? AND path = ?');
+    const find = db.prepare('SELECT state, policy, reason FROM sync_holds WHERE stage = ? AND path = ?');
+    const record = db.prepare('INSERT OR REPLACE INTO sync_holds (stage, path, state, policy, reason, held_at) VALUES (?, ?, ?, ?, ?, ?)');
+    const forget = db.prepare('DELETE FROM sync_holds WHERE stage = ? AND path = ?');
     return {
         indexed: archive => indexed.get(archive) !== undefined,
-        refused(stage, file) {
+        held(stage, file, state) {
             const row = find.get(stage, file);
-            return row !== undefined && row.policy === policyDigest && row.state === fileState(file);
+            return row !== undefined && state !== undefined && row.policy === policyDigest && row.state === state
+                ? row.reason : undefined;
         },
-        refuse(stage, file, readState, error) {
-            if (readState !== undefined && readState === fileState(file)) {
+        hold(stage, file, readState, currentState, error) {
+            if (readState !== undefined && readState === currentState) {
                 record.run(stage, file, readState, policyDigest, error.message, Date.now());
             }
         },
-        admitted(stage, file) {
+        release(stage, file) {
             forget.run(stage, file);
         },
     };
 }
-/** A refusal for a file that no longer exists has nothing left to protect. */
-function forgetVanishedRefusals(db) {
-    const forget = db.prepare('DELETE FROM sync_refusals WHERE stage = ? AND path = ?');
-    for (const row of db.prepare('SELECT stage, path FROM sync_refusals').all()) {
+/** A hold on a file that no longer exists has nothing left to protect. */
+function releaseVanishedHolds(db) {
+    const forget = db.prepare('DELETE FROM sync_holds WHERE stage = ? AND path = ?');
+    for (const row of db.prepare('SELECT stage, path FROM sync_holds').all()) {
         if (fileState(row.path) === undefined)
             forget.run(row.stage, row.path);
     }
+}
+/** Count a stage that stopped on a file's content rather than failing. */
+function countHold(result, error) {
+    if (isScreeningRefusal(error))
+        result.refused++;
+    else if (isArchiveDivergence(error))
+        result.diverged++;
+    else
+        return false;
+    return true;
+}
+function countHeld(result, reason) {
+    if (isArchiveDivergence(new Error(reason)))
+        result.diverged++;
+    else
+        result.refused++;
 }
 export async function syncConversations(sourceDir, destDir, options = {}) {
     const exclusions = readRecordExclusions();
@@ -157,6 +179,7 @@ export async function syncConversations(sourceDir, destDir, options = {}) {
         deferred: 0,
         deferredOversize: 0,
         refused: 0,
+        diverged: 0,
         errors: []
     };
     // Ensure source directory exists
@@ -200,7 +223,7 @@ export async function syncConversations(sourceDir, destDir, options = {}) {
     }
     // Recent conversations are the most useful to recall, so a bounded run reaches them first.
     candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
-    // Refusals are remembered for this exact policy; any policy change retries them.
+    // Holds are remembered for this exact policy; any policy change retries them.
     const policyDigest = crypto.createHash('sha256').update(JSON.stringify(exclusions)).digest('hex');
     let state;
     let closeState;
@@ -208,7 +231,7 @@ export async function syncConversations(sourceDir, destDir, options = {}) {
         const { initDatabase } = await import('./db.js');
         const db = initDatabase();
         closeState = () => db.close();
-        forgetVanishedRefusals(db);
+        releaseVanishedHolds(db);
         state = createSyncState(db, policyDigest);
     }
     try {
@@ -221,11 +244,12 @@ export async function syncConversations(sourceDir, destDir, options = {}) {
                     if (state && !pastDeadline(budget) && !state.indexed(destFile))
                         filesToIndex.push(destFile);
                 }
-                else if (state?.refused('admission', srcFile)) {
-                    result.refused++;
-                    continue;
-                }
                 else {
+                    const heldFor = state?.held('admission', srcFile, admissionState(srcFile, destFile));
+                    if (heldFor !== undefined) {
+                        countHeld(result, heldFor);
+                        continue;
+                    }
                     const cost = admissionCost(candidate);
                     if (maxFileBytes !== undefined && cost > maxFileBytes) {
                         result.deferredOversize++;
@@ -244,19 +268,20 @@ export async function syncConversations(sourceDir, destDir, options = {}) {
                     }
                     budget.files++;
                     budget.bytes += cost;
-                    const readState = fileState(srcFile);
+                    const readState = admissionState(srcFile, destFile);
+                    // Index rows address archive lines, so an indexed archive keeps its coordinates.
+                    const keepCoordinates = state !== undefined && statIfExists(destFile)?.isFile() === true && state.indexed(destFile);
                     let wasCopied;
                     try {
-                        wasCopied = await archiveAdmittedConversation(srcFile, destFile, exclusions);
+                        wasCopied = await archiveAdmittedConversation(srcFile, destFile, exclusions, { keepCoordinates });
                     }
                     catch (error) {
-                        if (!isScreeningRefusal(error))
+                        if (!countHold(result, error))
                             throw error;
-                        result.refused++;
-                        state?.refuse('admission', srcFile, readState, error);
+                        state?.hold('admission', srcFile, readState, admissionState(srcFile, destFile), error);
                         continue;
                     }
-                    state?.admitted('admission', srcFile);
+                    state?.release('admission', srcFile);
                     if (wasCopied) {
                         result.copied++;
                         filesToIndex.push(destFile);
@@ -338,11 +363,12 @@ export async function syncConversations(sourceDir, destDir, options = {}) {
                     result.deferred++;
                     continue;
                 }
-                if (indexState.refused('index', file)) {
-                    result.refused++;
+                const readState = fileState(file);
+                const heldFor = indexState.held('index', file, readState);
+                if (heldFor !== undefined) {
+                    countHeld(result, heldFor);
                     continue;
                 }
-                const readState = fileState(file);
                 try {
                     // Check for DO NOT INDEX marker
                     if (shouldSkipConversation(file)) {
@@ -364,12 +390,11 @@ export async function syncConversations(sourceDir, destDir, options = {}) {
                         insertExchange(db, exchange, embedding, toolNames);
                     }
                     result.indexed++;
-                    indexState.admitted('index', file);
+                    indexState.release('index', file);
                 }
                 catch (error) {
-                    if (isScreeningRefusal(error)) {
-                        result.refused++;
-                        indexState.refuse('index', file, readState, error);
+                    if (countHold(result, error)) {
+                        indexState.hold('index', file, readState, fileState(file), error);
                         continue;
                     }
                     result.errors.push({

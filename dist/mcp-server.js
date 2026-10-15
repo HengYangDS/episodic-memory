@@ -31341,13 +31341,13 @@ function initDatabase() {
     )
   `);
   db.exec(`
-    CREATE TABLE IF NOT EXISTS sync_refusals (
+    CREATE TABLE IF NOT EXISTS sync_holds (
       stage TEXT NOT NULL,
       path TEXT NOT NULL,
       state TEXT NOT NULL,
       policy TEXT NOT NULL,
       reason TEXT NOT NULL,
-      refused_at INTEGER NOT NULL,
+      held_at INTEGER NOT NULL,
       PRIMARY KEY (stage, path)
     )
   `);

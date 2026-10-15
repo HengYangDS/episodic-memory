@@ -62,8 +62,16 @@ export declare function archiveIsCurrent(source: string, destination: string, po
  * output is still screened at the read boundary.
  */
 export declare function archiveScreenedUnderPolicy(archive: string, archiveRoot: string, policy?: RecordExclusions | null, policyChangedMs?: number): boolean;
-/** Publish only admitted bytes. Never write an unfiltered temporary copy. */
-export declare function archiveAdmittedConversation(source: string, destination: string, policy?: RecordExclusions | null): Promise<boolean>;
+/** True when admission kept an archive because its source was rewritten under it. */
+export declare function isArchiveDivergence(error: unknown): boolean;
+/**
+ * Publish only admitted bytes. Never write an unfiltered temporary copy.
+ * With `keepCoordinates`, an existing archive is replaced only by an admitted
+ * form that keeps all of its lines where they are.
+ */
+export declare function archiveAdmittedConversation(source: string, destination: string, policy?: RecordExclusions | null, options?: {
+    keepCoordinates?: boolean;
+}): Promise<boolean>;
 /** Request-local admission: retained search rows are not trusted merely because they were indexed. */
 export declare function createSearchAdmission(): {
     admit(exchange: ConversationExchange): ConversationExchange | null;

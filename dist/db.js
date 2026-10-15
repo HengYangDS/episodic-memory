@@ -157,17 +157,17 @@ export function initDatabase() {
       embedding FLOAT[384]
     )
   `);
-    // Sync stages that screening refused for a file's exact state under an exact
-    // policy. Retrying unchanged bytes cannot succeed, so sync skips them until
-    // the file or the policy changes.
+    // Sync stages held for a file's exact state under an exact policy: screening
+    // refused its content, or its source was rewritten under an indexed archive.
+    // Retrying the same state cannot succeed, so sync skips it until it changes.
     db.exec(`
-    CREATE TABLE IF NOT EXISTS sync_refusals (
+    CREATE TABLE IF NOT EXISTS sync_holds (
       stage TEXT NOT NULL,
       path TEXT NOT NULL,
       state TEXT NOT NULL,
       policy TEXT NOT NULL,
       reason TEXT NOT NULL,
-      refused_at INTEGER NOT NULL,
+      held_at INTEGER NOT NULL,
       PRIMARY KEY (stage, path)
     )
   `);

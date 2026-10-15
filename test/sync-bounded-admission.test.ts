@@ -219,10 +219,10 @@ describe('append-only growth', () => {
     expect(fs.readFileSync(archive, 'utf8')).toBe(await fullAdmission(source));
   });
 
-  it('falls back to a full admission when the prefix was rewritten', async () => {
+  it('falls back to a full admission when the prefix of an unindexed archive was rewritten', async () => {
     writePolicy(fixture);
     const source = rollout(path.join(sourceDir, '2026', '10', '15'), 1, codexLines(session(1), 2), ago(60));
-    await syncConversations(sourceDir, destDir, { skipSummaries: true });
+    await syncConversations(sourceDir, destDir, { skipSummaries: true, skipIndex: true });
     fs.writeFileSync(source, codexLines(session(1), 2).replace('question 1', 'question one') + codexLines(session(1), 1, 3));
     bump(source);
     await syncConversations(sourceDir, destDir, { skipSummaries: true });

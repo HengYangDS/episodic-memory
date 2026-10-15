@@ -10,6 +10,8 @@ export interface SyncResult {
     deferredOversize: number;
     /** Transcripts whose current bytes screening refuses; retried once they or the policy change. */
     refused: number;
+    /** Rewritten transcripts whose indexed archive is kept, because index rows address its lines. */
+    diverged: number;
     errors: Array<{
         file: string;
         error: string;

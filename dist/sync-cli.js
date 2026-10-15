@@ -232,7 +232,7 @@ console.log('Syncing conversations...');
 console.log(`Sources: ${sourceDirs.join(', ')}`);
 console.log(`Destination: ${destDir}\n`);
 async function syncAll() {
-    const totals = { copied: 0, skipped: 0, indexed: 0, summarized: 0, deferred: 0, deferredOversize: 0, refused: 0, errors: [], sourcesWithSummaryWork: 0, totalNeedingSummaries: 0 };
+    const totals = { copied: 0, skipped: 0, indexed: 0, summarized: 0, deferred: 0, deferredOversize: 0, refused: 0, diverged: 0, errors: [], sourcesWithSummaryWork: 0, totalNeedingSummaries: 0 };
     const budget = createSyncBudget(syncLimits);
     for (const sourceDir of sourceDirs) {
         const result = await syncConversations(sourceDir, destDir, { ...syncOptions, summaryLimit, budget });
@@ -243,6 +243,7 @@ async function syncAll() {
         totals.deferred += result.deferred;
         totals.deferredOversize += result.deferredOversize;
         totals.refused += result.refused;
+        totals.diverged += result.diverged;
         totals.errors.push(...result.errors);
     }
     // Re-embedding is further work, so a run past its deadline leaves it for the next sync.
@@ -263,6 +264,9 @@ async function syncAll() {
     }
     if (totals.refused > 0) {
         console.log(`  Refused: ${totals.refused} (screening refuses their current content; retried when they or the policy change)`);
+    }
+    if (totals.diverged > 0) {
+        console.log(`  Diverged: ${totals.diverged} (source rewritten under an indexed archive; archive and index rows kept)`);
     }
     if (syncOptions.skipSummaries) {
         console.log('  Summaries: skipped (EPISODIC_MEMORY_SKIP_SUMMARIES=1)');
